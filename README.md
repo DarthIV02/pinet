@@ -257,14 +257,14 @@ python -m src.benchmarks.QP.run_QP --seed 0 --id <ID> --config <CONFIG>  --proj_
 ```
 To select `ID`, `CONFIG`, and `METHOD`, please refer to the bash script above.
 
-> [!WARNING] Large dataset
-> The repo contains only the data to run the small benchmark. For the large one, you can refer to the supplementary material on OpenReview.
+> [!WARNING]
+> **Large dataset**: The repo contains only the data to run the small benchmark. For the large one, you can refer to the supplementary material on OpenReview.
 In a future release, we plan to provide several datasets with [Hugging face 🤗](https://huggingface.co/) or similar providers, and this step will be less tedious.
 
 For `DC3`, we used the [open-source implementation](https://github.com/locuslab/DC3).
 
-> [!TIP] With Docker 🐳
-> To run the above commands within th docker container, you can use
+> [!TIP]
+> **With Docker 🐳**: To run the above commands within th docker container, you can use
 > ```bash
 > docker compose run --rm pinet-cpu -m src.benchmarks.QP.run_QP --seed 0 --id <ID> --config <CONFIG>  --proj_method <METHOD> # run on CPU
 > docker compose run --rm pinet-gpu -m src.benchmarks.QP.run_QP --seed 0 --id <ID> --config <CONFIG>  --proj_method <METHOD> # run on GPU
