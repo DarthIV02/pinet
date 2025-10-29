@@ -1,52 +1,54 @@
-"""Box constraint module."""
+"""Box constraint module (PyTorch version)."""
 
-import numpy as np
-from jax import numpy as jnp
-
+import torch
 from pinet.dataclasses import BoxConstraintSpecification, ProjectionInstance
-
 from .base import Constraint
 
 
 class BoxConstraint(Constraint):
     """Box constraint set.
 
-    The box constraint set is defined as the Cartesian product of intervals.
-    The interval is defined by a lower and an upper bound.
-    The constraint possibly acts only on a subset of the dimensions,
-    defined by a mask.
+    The box constraint set is defined as the Cartesian product of intervals:
+        lb <= x <= ub
+    Optionally acts only on a subset of dimensions using a mask.
     """
 
-    def __init__(
-        self,
-        box_spec: BoxConstraintSpecification,
-    ) -> None:
+    def __init__(self, box_spec: BoxConstraintSpecification) -> None:
         """Initialize the box constraint.
 
         Args:
             box_spec (BoxConstraintSpecification): Specification of the box constraint.
-                For variable bounds, provide an example of the bounds.
+                For variable bounds, provide example bounds.
         """
         self.lb = box_spec.lb
         self.ub = box_spec.ub
         self.mask = box_spec.mask
-        self._dim = self.lb.shape[1] if self.lb is not None else self.ub.shape[1]
-        self.scale = jnp.ones((1, self._dim, 1))
 
+        # Determine dimension
+        self._dim = (
+            self.lb.shape[1] if self.lb is not None else self.ub.shape[1]
+        )
+
+        # Scale factor placeholder
+        self.scale = torch.ones((1, self._dim, 1),
+                                device=(self.lb.device if self.lb is not None else "cpu"))
+
+        # Default mask: all dimensions active
         if self.mask is None:
-            self.mask = np.ones(shape=(self.dim), dtype=jnp.bool_)
+            self.mask = torch.ones(
+                self._dim, dtype=torch.bool, device=self.scale.device
+            )
 
     def get_params(
         self, yraw: ProjectionInstance
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get the parameters of the box constraint.
 
         Args:
-            yraw (ProjectionInstance): ProjectionInstance to get the parameters from.
+            yraw (ProjectionInstance): ProjectionInstance to get parameters from.
 
         Returns:
-            tuple: A tuple containing the lower and upper bounds and the mask.
-                Each of shape (batch_size, n_constraints, 1).
+            (lb, ub, mask): Tensors for lower/upper bounds and active dimension mask.
         """
         lb = (
             (yraw.box.lb * self.scale)
@@ -59,61 +61,54 @@ class BoxConstraint(Constraint):
             else self.ub
         )
         mask = yraw.box.mask if yraw.box and yraw.box.mask is not None else self.mask
-        if lb is None:
-            lb = -jnp.inf * jnp.ones_like(ub)
-        if ub is None:
-            ub = jnp.inf * jnp.ones_like(lb)
-        # NOTE: Mask is never None
+
+        device = yraw.x.device
+        lb = lb.to(device) if lb is not None else -torch.inf * torch.ones_like(ub)
+        ub = ub.to(device) if ub is not None else torch.inf * torch.ones_like(lb)
+        mask = mask.to(device)
 
         return lb, ub, mask
 
     def project(self, yraw: ProjectionInstance) -> ProjectionInstance:
-        """Project the input to the feasible region.
+        """Project x onto the feasible region defined by the box.
 
         Args:
-            yraw (ProjectionInstance): ProjectionInstance to projection.
-                The .x attribute is the point to project.
+            yraw (ProjectionInstance): Input to project. The .x attribute is used.
 
         Returns:
-            ProjectionInstance: The projected point for each point in the batch.
-                .x of shape (batch_size, dimension, 1).
+            ProjectionInstance: The projected instance with updated x.
         """
         lb, ub, mask = self.get_params(yraw)
-        return yraw.update(
-            x=yraw.x.at[:, mask, :].set(jnp.clip(yraw.x[:, mask, :], lb, ub))
-        )
 
-    def cv(self, y: ProjectionInstance) -> jnp.ndarray:
+        # Apply projection only on masked dimensions
+        x_proj = yraw.x.clone()
+        x_proj[:, mask, :] = torch.clamp(yraw.x[:, mask, :], lb, ub)
+        return yraw.update(x=x_proj)
+
+    def cv(self, y: ProjectionInstance) -> torch.Tensor:
         """Compute the constraint violation.
 
         Args:
             y (ProjectionInstance): ProjectionInstance to evaluate.
 
         Returns:
-            jnp.ndarray: The constraint violation for each point in the batch.
-                Shape (batch_size, 1, 1).
+            torch.Tensor: The constraint violation for each point in the batch.
+                Shape (batch_size, 1, 1)
         """
         lb, ub, mask = self.get_params(y)
-        cvs = jnp.maximum(
-            jnp.max(y.x[:, mask, :] - ub, axis=1, keepdims=True),
-            jnp.max(lb - y.x[:, mask, :], axis=1, keepdims=True),
-        )
-        return jnp.maximum(cvs, 0)
+        x_masked = y.x[:, mask, :]
+
+        cv_ub = torch.max(x_masked - ub, dim=1, keepdim=True).values
+        cv_lb = torch.max(lb - x_masked, dim=1, keepdim=True).values
+        cvs = torch.maximum(cv_ub, cv_lb)
+        return torch.maximum(cvs, torch.zeros_like(cvs))
 
     @property
     def dim(self) -> int:
-        """Return the dimension of the constraint set.
-
-        Returns:
-            int: The dimension of the constraint set.
-        """
+        """Return the dimension of the constraint set."""
         return self._dim
 
     @property
     def n_constraints(self) -> int:
-        """Return the number of constraints.
-
-        Returns:
-            int: The number of constraints.
-        """
+        """Return the number of constraints."""
         return self._dim

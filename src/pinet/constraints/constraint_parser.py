@@ -1,12 +1,9 @@
-"""Parser of constraints to lifted representation module."""
+"""Parser of constraints to lifted representation module (PyTorch version)."""
 
 from typing import Optional
-
-import jax.numpy as jnp
-import numpy as np
+import torch
 
 from pinet.dataclasses import BoxConstraintSpecification
-
 from .affine_equality import EqualityConstraint
 from .affine_inequality import AffineInequalityConstraint
 from .box import BoxConstraint
@@ -15,17 +12,17 @@ from .box import BoxConstraint
 class ConstraintParser:
     """Parse constraints into a lifted representation.
 
-    This class takes as input an equality, an inequality, and a box constraint.
-    It returns an equivalent equality and box constraint in a lifted representation.
+    Converts equality, inequality, and box constraints into a unified lifted form
+    suitable for optimization and projection methods.
     """
 
     def __init__(
         self,
-        eq_constraint: EqualityConstraint,
-        ineq_constraint: AffineInequalityConstraint,
-        box_constraint: BoxConstraint = None,
+        eq_constraint: Optional[EqualityConstraint],
+        ineq_constraint: Optional[AffineInequalityConstraint],
+        box_constraint: Optional[BoxConstraint] = None,
     ) -> None:
-        """Initiaze the constraint parser.
+        """Initialize the constraint parser.
 
         Args:
             eq_constraint (EqualityConstraint): An equality constraint.
@@ -33,93 +30,112 @@ class ConstraintParser:
             box_constraint (BoxConstraint): A box constraint.
         """
         if ineq_constraint is None:
-            # The constraints do not need lifting.
-            self.parse = lambda method: (eq_constraint, box_constraint, lambda y: y)
+            # No lifting needed
+            self.parse = lambda method=None: (eq_constraint, box_constraint, lambda y: y)
             return
 
+        device = (
+            ineq_constraint.C.device
+            if hasattr(ineq_constraint, "C")
+            else torch.device("cpu")
+        )
+
         self.dim = ineq_constraint.dim
+
+        # Default equality constraint if not provided
         if eq_constraint is None:
             eq_constraint = EqualityConstraint(
-                A=jnp.empty((1, 0, self.dim)),
-                b=jnp.empty((1, 0, 1)),
+                A=torch.empty((1, 0, self.dim), device=device),
+                b=torch.empty((1, 0, 1), device=device),
                 method=None,
                 var_b=False,
                 var_A=False,
             )
 
         self.eq_constraint = eq_constraint
-        self.n_eq = eq_constraint.n_constraints
         self.ineq_constraint = ineq_constraint
-        self.n_ineq = ineq_constraint.n_constraints
         self.box_constraint = box_constraint
 
-        # Batch consistency checks
-        assert (
-            self.eq_constraint.A.shape[0] == self.ineq_constraint.C.shape[0]
-            or self.eq_constraint.A.shape[0] == 1
-            or self.ineq_constraint.C.shape[0] == 1
-        ), "Batch sizes of A and C must be consistent."
-        if self.box_constraint is not None:
-            assert (
-                self.ineq_constraint.lb.shape[0] == self.box_constraint.lb.shape[0]
-                or self.ineq_constraint.lb.shape[0] == 1
-                or self.box_constraint.lb.shape[0] == 1
-            ), "Batch sizes of lb and lower_bound must be consistent."
+        self.n_eq = eq_constraint.n_constraints
+        self.n_ineq = ineq_constraint.n_constraints
 
+        # Batch size consistency checks
+        assert (
+            eq_constraint.A.shape[0] == ineq_constraint.C.shape[0]
+            or eq_constraint.A.shape[0] == 1
+            or ineq_constraint.C.shape[0] == 1
+        ), "Batch sizes of A and C must be consistent."
+
+        if box_constraint is not None:
             assert (
-                self.ineq_constraint.ub.shape[0] == self.box_constraint.ub.shape[0]
-                or self.ineq_constraint.ub.shape[0] == 1
-                or self.box_constraint.ub.shape[0] == 1
+                ineq_constraint.lb.shape[0] == box_constraint.lb.shape[0]
+                or ineq_constraint.lb.shape[0] == 1
+                or box_constraint.lb.shape[0] == 1
+            ), "Batch sizes of lb and lower_bound must be consistent."
+            assert (
+                ineq_constraint.ub.shape[0] == box_constraint.ub.shape[0]
+                or ineq_constraint.ub.shape[0] == 1
+                or box_constraint.ub.shape[0] == 1
             ), "Batch sizes of ub and upper_bound must be consistent."
 
     def parse(
         self, method: Optional[str] = "pinv"
-    ) -> tuple[EqualityConstraint, BoxConstraint]:
-        """Parse the constraints into a lifted representation.
+    ) -> tuple[EqualityConstraint, BoxConstraint, callable]:
+        """Parse constraints into a lifted representation.
 
         Args:
-            method (Optional[str]): Method to use for solving linear systems.
-                Valid methods are "pinv", and None.
+            method (Optional[str]): Method used for solving linear systems ("pinv", None).
 
         Returns:
-            A tuple of constraints: (eq_constraint, box_constraint)
+            tuple: (eq_lifted, box_lifted, lift_fn)
         """
-        # Build lifted A matrix.
-        # Maximum batch size between A and C
+        device = self.eq_constraint.A.device
+
+        # Determine batch size for combining equality and inequality constraints
         mbAC = max(self.eq_constraint.A.shape[0], self.ineq_constraint.C.shape[0])
-        first_row_batched = jnp.tile(
-            jnp.concatenate(
+
+        # === Build lifted equality constraint ===
+        first_row_batched = torch.tile(
+            torch.cat(
                 [
                     self.eq_constraint.A,
-                    jnp.zeros(
-                        shape=(self.eq_constraint.A.shape[0], self.n_eq, self.n_ineq)
+                    torch.zeros(
+                        (self.eq_constraint.A.shape[0], self.n_eq, self.n_ineq),
+                        device=device,
                     ),
                 ],
-                axis=2,
+                dim=2,
             ),
             (mbAC // self.eq_constraint.A.shape[0], 1, 1),
         )
-        second_row_batched = jnp.tile(
-            jnp.concatenate(
+
+        second_row_batched = torch.tile(
+            torch.cat(
                 [
                     self.ineq_constraint.C,
-                    -jnp.tile(
-                        jnp.eye(self.n_ineq).reshape(1, self.n_ineq, self.n_ineq),
+                    -torch.tile(
+                        torch.eye(self.n_ineq, device=device).reshape(
+                            1, self.n_ineq, self.n_ineq
+                        ),
                         (self.ineq_constraint.C.shape[0], 1, 1),
                     ),
                 ],
-                axis=2,
+                dim=2,
             ),
             (mbAC // self.ineq_constraint.C.shape[0], 1, 1),
         )
-        A_lifted = jnp.concatenate([first_row_batched, second_row_batched], axis=1)
-        b_lifted = jnp.concatenate(
+
+        A_lifted = torch.cat([first_row_batched, second_row_batched], dim=1)
+        b_lifted = torch.cat(
             [
                 self.eq_constraint.b,
-                jnp.zeros(shape=(self.eq_constraint.b.shape[0], self.n_ineq, 1)),
+                torch.zeros(
+                    (self.eq_constraint.b.shape[0], self.n_ineq, 1), device=device
+                ),
             ],
-            axis=1,
+            dim=1,
         )
+
         eq_lifted = EqualityConstraint(
             A=A_lifted,
             b=b_lifted,
@@ -128,11 +144,16 @@ class ConstraintParser:
             var_A=self.eq_constraint.var_A,
         )
 
+        # === Build lifted box constraint ===
         if self.box_constraint is None:
-            # We only project the lifted part.
-            box_mask = np.concatenate(
-                [np.zeros(self.dim, dtype=bool), np.ones(self.n_ineq, dtype=bool)]
+            # Only project lifted inequality part
+            box_mask = torch.cat(
+                [
+                    torch.zeros(self.dim, dtype=torch.bool, device=device),
+                    torch.ones(self.n_ineq, dtype=torch.bool, device=device),
+                ]
             )
+
             box_lifted = BoxConstraint(
                 BoxConstraintSpecification(
                     lb=self.ineq_constraint.lb,
@@ -140,50 +161,50 @@ class ConstraintParser:
                     mask=box_mask,
                 )
             )
+
         else:
-            # We project both the lifted and the initial box
-            box_mask = jnp.concatenate(
+            # Project both original and lifted parts
+            box_mask = torch.cat(
                 [
-                    self.box_constraint.mask,
-                    jnp.ones(self.n_ineq, dtype=bool),
+                    self.box_constraint.mask.to(device),
+                    torch.ones(self.n_ineq, dtype=torch.bool, device=device),
                 ]
             )
-            # Maximum batch dimension for lower bound
+
             mblb = max(
-                self.box_constraint.lb.shape[0],
-                self.ineq_constraint.lb.shape[0],
+                self.box_constraint.lb.shape[0], self.ineq_constraint.lb.shape[0]
             )
-            lifted_lb = jnp.concatenate(
+            lifted_lb = torch.cat(
                 [
-                    jnp.tile(
+                    torch.tile(
                         self.box_constraint.lb,
                         (mblb // self.box_constraint.lb.shape[0], 1, 1),
                     ),
-                    jnp.tile(
+                    torch.tile(
                         self.ineq_constraint.lb,
                         (mblb // self.ineq_constraint.lb.shape[0], 1, 1),
                     ),
                 ],
-                axis=1,
+                dim=1,
             )
-            # Maximum batch dimension for upper bound
+
             mbub = max(
-                self.box_constraint.ub.shape[0],
-                self.ineq_constraint.ub.shape[0],
+                self.box_constraint.ub.shape[0], self.ineq_constraint.ub.shape[0]
             )
-            lifted_ub = jnp.concatenate(
+            lifted_ub = torch.cat(
                 [
-                    jnp.tile(
+                    torch.tile(
                         self.box_constraint.ub,
                         (mbub // self.box_constraint.ub.shape[0], 1, 1),
                     ),
-                    jnp.tile(
+                    torch.tile(
                         self.ineq_constraint.ub,
                         (mbub // self.ineq_constraint.ub.shape[0], 1, 1),
                     ),
                 ],
-                axis=1,
+                dim=1,
             )
+
             box_lifted = BoxConstraint(
                 BoxConstraintSpecification(
                     lb=lifted_lb,
@@ -192,15 +213,22 @@ class ConstraintParser:
                 )
             )
 
+        # === Define lifting function ===
         def lift(y):
             """Lift the input to the lifted dimension."""
-            y = y.update(x=jnp.concatenate([y.x, self.ineq_constraint.C @ y.x], axis=1))
+            device = y.x.device
+            y = y.update(
+                x=torch.cat([y.x, self.ineq_constraint.C @ y.x], dim=1)
+            )
             if self.eq_constraint.var_b:
                 y = y.update(
                     eq=y.eq.update(
-                        b=jnp.concatenate(
-                            [y.eq.b, jnp.zeros((y.x.shape[0], self.n_ineq, 1))],
-                            axis=1,
+                        b=torch.cat(
+                            [
+                                y.eq.b,
+                                torch.zeros((y.x.shape[0], self.n_ineq, 1), device=device),
+                            ],
+                            dim=1,
                         )
                     )
                 )

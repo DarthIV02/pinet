@@ -1,100 +1,99 @@
-"""Projection layers using other approaches."""
+"""Projection layers using other approaches (PyTorch version)."""
 
 from typing import Callable
-
+import torch
 import cvxpy as cp
-import jax
-import jax.numpy as jnp
-import jaxopt
-from cvxpylayers.jax import CvxpyLayer
-
-jax.config.update("jax_enable_x64", True)
+import numpy as np
 
 
-def get_jaxopt_projection(
-    A: jnp.ndarray, C: jnp.ndarray, d: jnp.ndarray, dim: int, tol=1e-3
-) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """Compute a batched projection function for polyhedral constraints using JAXopt.
+def get_torch_projection(
+    A: torch.Tensor, C: torch.Tensor, d: torch.Tensor, dim: int, tol: float = 1e-3
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """
+    Compute a batched projection function for polyhedral constraints using CVXPY solver.
+    This replaces jaxopt.OSQP.
 
-    This function creates a projection operator using the jaxopt.OSQP solver.
-    The projection is formulated as the quadratic program:
-    minimize   (1/2) * ||x - xx||^2
-    subject to A x = b
-               C x <= d,
-    where the quadratic term is given by the identity matrix of size `dim`.
-
-    The resulting function is JIT-compiled and vectorized.
+    Solve for each input xx and equality rhs bb:
+        minimize   0.5 ||x - xx||^2
+        subject to A x = bb
+                   C x <= d
 
     Args:
-        A (jnp.ndarray): Coefficient matrix for equality constraints.
-        C (jnp.ndarray): Coefficient matrix for inequality constraints.
-        d (jnp.ndarray): Right-hand side vector for inequality constraints.
+        A (torch.Tensor): Equality constraint matrix (shape: [n_eq, dim]).
+        C (torch.Tensor): Inequality constraint matrix (shape: [n_ineq, dim]).
+        d (torch.Tensor): Upper bounds for inequalities (shape: [n_ineq]).
         dim (int): Dimension of the variable x.
-        tol (float, optional): Tolerance for the solver. Defaults to 1e-3.
+        tol (float): Solver tolerance (not used directly in cvxpy).
 
     Returns:
-        Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-        A JIT-compiled and vectorized function
-        that takes a batch of input vectors (shape: (batch_size, dim))
-        and returns their corresponding projections.
+        Callable[[torch.Tensor, torch.Tensor], torch.Tensor]: Projection function.
     """
-    qp = jaxopt.OSQP(tol=tol)
-    Q = jnp.eye(dim)
-    jaxopt_proj = jax.jit(
-        jax.vmap(
-            lambda xx, bb: qp.run(
-                params_obj=(Q, -xx), params_eq=(A, bb[:, 0]), params_ineq=(C, d)
-            ).params.primal,
-            in_axes=[0, 0],
-        )
-    )
+    A_np = A.cpu().numpy()
+    C_np = C.cpu().numpy()
+    d_np = d.cpu().numpy()
+    n_eq = A.shape[0]
 
-    return jaxopt_proj
+    def project(xx: torch.Tensor, bb: torch.Tensor) -> torch.Tensor:
+        xx_np = xx.detach().cpu().numpy()
+        bb_np = bb.detach().cpu().numpy()
+        proj_batch = []
+
+        for xvec, bvec in zip(xx_np, bb_np):
+            y = cp.Variable(dim)
+            constraints = [A_np @ y == bvec, C_np @ y <= d_np]
+            objective = cp.Minimize(0.5 * cp.sum_squares(y - xvec))
+            prob = cp.Problem(objective, constraints)
+            prob.solve(solver=cp.OSQP, eps_abs=tol, eps_rel=tol, warm_start=True, verbose=False)
+            proj_batch.append(y.value)
+
+        proj_batch = torch.tensor(np.stack(proj_batch), dtype=xx.dtype, device=xx.device)
+        return proj_batch
+
+    return project
 
 
 def get_cvxpy_projection(
-    A: jnp.ndarray,
-    C: jnp.ndarray,
-    d: jnp.ndarray,
+    A: torch.Tensor,
+    C: torch.Tensor,
+    d: torch.Tensor,
     dim: int,
-) -> Callable[[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray]]:
-    """Constructs and returns a CVXPY-based projection layer callable.
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """
+    Construct a CVXPY-based projection layer.
 
-    The projection is formulated as a quadratic minimization problem that minimizes
-    the squared distance between the projection variable and an input point xproj, subject
-    to the constraints:
-        A @ y = b   (equality constraints)
-        C @ y <= d  (inequality constraints)
+    Solve for each input xx and equality rhs bb:
+        minimize ||y - xx||^2
+        subject to A y = bb
+                   C y <= d
 
     Args:
-        A (jnp.ndarray): Coefficient matrix for equality constraints.
-        C (jnp.ndarray): Coefficient matrix for inequality constraints..
-        d (jnp.ndarray): Right-hand side vector for inequality constraints.
+        A (torch.Tensor): Equality constraint matrix [n_eq, dim].
+        C (torch.Tensor): Inequality constraint matrix [n_ineq, dim].
+        d (torch.Tensor): Upper bounds for inequalities [n_ineq].
         dim (int): Dimension of the variable x.
 
     Returns:
-        Callable[[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray]]:
-        A callable CVXPY layer that takes two parameters:
-        an input vector (xproj) to be projected and a corresponding vector b for
-        the equality constraints.
-        The callable returns the projected vector as a jnp.ndarray.
+        Callable[[torch.Tensor, torch.Tensor], torch.Tensor]: Projection function.
     """
+    A_np = A.cpu().numpy()
+    C_np = C.cpu().numpy()
+    d_np = d.cpu().numpy()
     n_eq = A.shape[0]
-    ycvxpy = cp.Variable(dim)
-    xproj = cp.Parameter(dim)
-    b = cp.Parameter(n_eq)
-    constraints = [
-        A @ ycvxpy == b,
-        C @ ycvxpy <= d,
-    ]
-    objective = cp.Minimize(cp.sum_squares(ycvxpy - xproj))
-    problem_cvxpy = cp.Problem(objective=objective, constraints=constraints)
-    assert problem_cvxpy.is_dpp()
 
-    cvxpylayer = CvxpyLayer(
-        problem_cvxpy,
-        parameters=[xproj, b],
-        variables=[ycvxpy],
-    )
+    def project(xx: torch.Tensor, bb: torch.Tensor) -> torch.Tensor:
+        xx_np = xx.detach().cpu().numpy()
+        bb_np = bb.detach().cpu().numpy()
+        proj_batch = []
 
-    return cvxpylayer
+        for xvec, bvec in zip(xx_np, bb_np):
+            y = cp.Variable(dim)
+            constraints = [A_np @ y == bvec, C_np @ y <= d_np]
+            objective = cp.Minimize(cp.sum_squares(y - xvec))
+            prob = cp.Problem(objective, constraints)
+            prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
+            proj_batch.append(y.value)
+
+        proj_batch = torch.tensor(np.stack(proj_batch), dtype=xx.dtype, device=xx.device)
+        return proj_batch
+
+    return project

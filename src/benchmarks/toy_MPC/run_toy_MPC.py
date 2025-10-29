@@ -1,169 +1,107 @@
-"""Run HCNN on toy MPC problem."""
+"""Run HCNN on toy MPC problem (PyTorch version, GPU ready)."""
 
 import argparse
 import datetime
 import pathlib
 import time
 import timeit
-from typing import Callable
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
-import torch
-from flax.serialization import to_bytes
-from flax.training import train_state
 from tqdm import tqdm
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
-from benchmarks.toy_MPC.load_toy_MPC import JaxDataLoader, ToyMPCDataset, load_data
+from benchmarks.toy_MPC.load_toy_MPC import ToyMPCDataset, load_data
 from benchmarks.toy_MPC.model import setup_model
 from benchmarks.toy_MPC.plotting import generate_trajectories, plot_training
 from src.tools.utils import GracefulShutdown, Logger, load_configuration
 
-jax.config.update("jax_enable_x64", True)
 
+# ============================================================
+#   EVALUATION (PyTorch)
+# ============================================================
 
 def evaluate_hcnn(
-    loader: ToyMPCDataset | JaxDataLoader,
-    state: train_state.TrainState,
-    batched_objective: Callable[[jnp.ndarray], jnp.ndarray],
-    A: jnp.ndarray,
-    lb: jnp.ndarray,
-    ub: jnp.ndarray,
+    loader: ToyMPCDataset,
+    model: nn.Module,
+    batched_objective,
+    A: torch.Tensor,
+    lb: torch.Tensor,
+    ub: torch.Tensor,
     prefix: str,
+    device: torch.device,
     time_evals: int = 10,
     print_res: bool = True,
     cv_tol: float = 1e-3,
     single_instance: bool = True,
-) -> tuple[
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    float,
-    float,
-    float,
-]:
-    """Evaluate the performance of HCNN.
+):
+    model.eval()
+    opt_obj, hcnn_obj, eq_cv, ineq_cv = [], [], [], []
 
-    Args:
-        loader (ToyMPCDataset | JaxDataLoader): DataLoader for the dataset.
-        state (train_state.TrainState): The trained model state.
-        batched_objective (Callable): Function to compute the objective.
-        A (jnp.ndarray): Coefficient matrix for equality constraints.
-        lb (jnp.ndarray): Lower bounds for the decision variables.
-        ub (jnp.ndarray): Upper bounds for the decision variables.
-        prefix (str): Prefix for logging.
-        time_evals (int, optional): Number of times to evaluate the model.
-        print_res (bool, optional): Whether to print the results.
-        cv_tol (float, optional): Tolerance for constraint violations.
-        single_instance (bool, optional): Whether to evaluate a single instance or not.
+    with torch.no_grad():
+        for X, obj in loader:
+            X, obj = X.to(device), obj.to(device)
+            X_full = torch.cat(
+                (X, torch.zeros(X.shape[0], A.shape[1] - X.shape[1], 1, device=device)), dim=1
+            )
+            predictions = model(X[:, :, 0], X_full, test=True)
 
-    Returns:
-        tuple: A tuple containing:
-            - opt_obj (jnp.ndarray): Optimal objective values.
-            - hcnn_obj (jnp.ndarray): HCNN objective values.
-            - eq_cv (jnp.ndarray): Equality constraint violations.
-            - ineq_cv (jnp.ndarray): Inequality constraint violations.
-            - ineq_perc (float): Percentage of valid constraint violations.
-            - eval_time (float): Average evaluation time.
-            - eval_time_std (float): Standard deviation of evaluation time.
-    """
-    opt_obj = []
-    hcnn_obj = []
-    eq_cv = []
-    ineq_cv = []
-    for X, obj in loader:
-        X_full = jnp.concatenate(
-            (X, jnp.zeros((X.shape[0], A.shape[1] - X.shape[1], 1))), axis=1
-        )
-        predictions = state.apply_fn(
-            {"params": state.params},
-            X[:, :, 0],
-            X_full,
-            test=True,
-        )
-        opt_obj.append(obj)
-        hcnn_obj.append(batched_objective(predictions))
-        # Equality Constraint Violation
-        eq_cv_batch = jnp.abs(
-            A[0].reshape(1, A.shape[1], A.shape[2])
-            @ predictions.reshape(X.shape[0], A.shape[2], 1)
-            - X_full,
-        )
-        eq_cv_batch = jnp.max(eq_cv_batch, axis=1)
-        eq_cv.append(eq_cv_batch)
-        # Inequality Constraint Violation
-        ineq_cv_batch_ub = jnp.maximum(
-            predictions.reshape(X.shape[0], A.shape[2], 1) - ub, 0
-        )
-        ineq_cv_batch_lb = jnp.maximum(
-            lb - predictions.reshape(X.shape[0], A.shape[2], 1), 0
-        )
-        # Compute the maximum and normalize by the size
-        ineq_cv_batch = jnp.maximum(ineq_cv_batch_ub, ineq_cv_batch_lb) / ub
-        ineq_cv_batch = jnp.max(ineq_cv_batch, axis=1)
-        ineq_cv.append(ineq_cv_batch)
-    # Objectives
-    opt_obj = jnp.concatenate(opt_obj, axis=0)
-    opt_obj_mean = opt_obj.mean()
-    hcnn_obj = jnp.concatenate(hcnn_obj, axis=0)
-    hcnn_obj_mean = hcnn_obj.mean()
-    # Equality Constraints
-    eq_cv = jnp.concatenate(eq_cv, axis=0)
-    eq_cv_mean = eq_cv.mean()
-    eq_cv_max = eq_cv.max()
-    # Inequality Constraints
-    ineq_cv = jnp.concatenate(ineq_cv, axis=0)
-    ineq_cv_mean = ineq_cv.mean()
-    ineq_cv_max = ineq_cv.max()
-    ineq_perc = (1 - jnp.mean(ineq_cv > cv_tol)) * 100
-    # Inference time (assumes all the data in one batch)
-    if single_instance:
-        X_inf = X[:1, :, :]
-        X_inf_full = jnp.concatenate(
-            (X_inf, jnp.zeros((X_inf.shape[0], A.shape[1] - X_inf.shape[1], 1))), axis=1
-        )
-    else:
-        X_inf = X
-        X_inf_full = X_full
+            opt_obj.append(obj)
+            hcnn_obj.append(batched_objective(predictions))
+
+            # Equality constraint violation
+            eq_cv_batch = torch.abs(
+                torch.matmul(A[0].reshape(1, A.shape[1], A.shape[2]), predictions.reshape(X.shape[0], A.shape[2], 1))
+                - X_full
+            ).amax(dim=1)
+            eq_cv.append(eq_cv_batch)
+
+            # Inequality violation
+            ineq_cv_batch_ub = torch.clamp(predictions.reshape(X.shape[0], A.shape[2], 1) - ub, min=0)
+            ineq_cv_batch_lb = torch.clamp(lb - predictions.reshape(X.shape[0], A.shape[2], 1), min=0)
+            ineq_cv_batch = torch.maximum(ineq_cv_batch_ub, ineq_cv_batch_lb) / ub
+            ineq_cv.append(ineq_cv_batch.amax(dim=1))
+
+    # Aggregate
+    opt_obj = torch.cat(opt_obj, dim=0)
+    hcnn_obj = torch.cat(hcnn_obj, dim=0)
+    eq_cv = torch.cat(eq_cv, dim=0)
+    ineq_cv = torch.cat(ineq_cv, dim=0)
+
+    opt_obj_mean = opt_obj.mean().item()
+    hcnn_obj_mean = hcnn_obj.mean().item()
+    eq_cv_mean, eq_cv_max = eq_cv.mean().item(), eq_cv.max().item()
+    ineq_cv_mean, ineq_cv_max = ineq_cv.mean().item(), ineq_cv.max().item()
+    ineq_perc = (1 - (ineq_cv > cv_tol).float().mean().item()) * 100.0
+
+    # Inference time
+    model_input = X[:1, :, :] if single_instance else X
+    X_full_inf = torch.cat(
+        (model_input, torch.zeros(model_input.shape[0], A.shape[1] - model_input.shape[1], 1, device=device)), dim=1
+    )
+
     times = timeit.repeat(
-        lambda: state.apply_fn(
-            {"params": state.params},
-            X_inf[:, :, 0],
-            X_inf_full,
-            test=True,
-        ).block_until_ready(),
+        lambda: model(model_input[:, :, 0], X_full_inf, test=True),
         repeat=time_evals,
         number=1,
     )
-    eval_time = np.mean(times)
-    eval_time_std = np.std(times)
+    eval_time, eval_time_std = np.mean(times), np.std(times)
+
     if print_res:
         print(f"=========== {prefix} performance ===========")
-        print("Mean objective                : ", f"{hcnn_obj_mean:.5f}")
-        print(
-            "Mean|Max eq. cv               : ",
-            f"{eq_cv_mean:.5f}",
-            "|",
-            f"{eq_cv_max:.5f}",
-        )
-        print(
-            "Mean|Max normalized ineq. cv  : ",
-            f"{ineq_cv_mean:.5f}",
-            "|",
-            f"{ineq_cv_max:.5f}",
-        )
-        print(
-            "Perc of valid cv. tol.        : ",
-            f"{ineq_perc:.3f}%",
-        )
-        print("Time for evaluation [s]       : ", f"{eval_time:.5f}")
-        print("Optimal mean objective        : ", f"{opt_obj_mean:.5f}")
+        print(f"Mean objective                : {hcnn_obj_mean:.5f}")
+        print(f"Mean|Max eq. cv               : {eq_cv_mean:.5f} | {eq_cv_max:.5f}")
+        print(f"Mean|Max normalized ineq. cv  : {ineq_cv_mean:.5f} | {ineq_cv_max:.5f}")
+        print(f"Perc of valid cv. tol.        : {ineq_perc:.3f}%")
+        print(f"Time for evaluation [s]       : {eval_time:.5f}")
+        print(f"Optimal mean objective        : {opt_obj_mean:.5f}")
 
-    return (opt_obj, hcnn_obj, eq_cv, ineq_cv, ineq_perc, eval_time, eval_time_std)
+    return opt_obj, hcnn_obj, eq_cv, ineq_cv, ineq_perc, eval_time, eval_time_std
 
+
+# ============================================================
+#   MAIN (PyTorch)
+# ============================================================
 
 def main(
     filepath: str,
@@ -171,27 +109,16 @@ def main(
     SEED: int,
     PLOT_TRAINING: bool,
     SAVE_RESULTS: bool,
-    use_jax_loader: bool,
+    use_saved: bool,
+    results_folder: str | None,
     run_name: str,
-) -> train_state.TrainState:
-    """Main for running toy MPC benchmarks.
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+    torch.manual_seed(SEED)
 
-    Args:
-        filepath (str): Path to the dataset file.
-        config_path (str): Path to the configuration file.
-        SEED (int): Random seed for reproducibility.
-        PLOT_TRAINING (bool): Whether to plot training curves.
-        SAVE_RESULTS (bool): Whether to save the results.
-        use_jax_loader (bool): Whether to use JAX DataLoader or PyTorch DataLoader.
-        run_name (str): Name of the run for logging.
-
-    Returns:
-        train_state.TrainState: The trained model state.
-    """
     hyperparameters = load_configuration(config_path)
-    key = jax.random.PRNGKey(SEED)
-    loader_key, key = jax.random.split(key, 2)
-    # Parse data
+    
     (
         As,
         lbxs,
@@ -207,448 +134,159 @@ def main(
         valid_loader,
         test_loader,
         batched_objective,
-    ) = load_data(
-        filepath=filepath,
-        rng_key=loader_key,
-        val_split=hyperparameters["val_split"],
-        test_split=hyperparameters["test_split"],
-        batch_size=hyperparameters["batch_size"],
-        use_jax_loader=use_jax_loader,
-    )
+    ) = load_data(filepath=filepath, batch_size=hyperparameters["batch_size"])
+
+    # Move tensors to device
+    As, lbxs, ubxs, lbus, ubus, X = [t.float().to(device) for t in [As, lbxs, ubxs, lbus, ubus, X]]
 
     Y_DIM = As.shape[2]
-    # The X contains only the initial conditions.
-    # To properly define the equality constraints we need to append zeros
-    Xfull = jnp.concatenate(
-        (X, jnp.zeros((X.shape[0], As.shape[1] - X.shape[1], 1))), axis=1
-    )
-    lb = jnp.concatenate((lbxs, lbus), axis=1)
-    ub = jnp.concatenate((ubxs, ubus), axis=1)
-    # Setup projection layer
-    LEARNING_RATE = hyperparameters["learning_rate"]
-    # Setup the model
-    model, params, train_step = setup_model(
-        rng_key=key,
+    X_full = torch.cat((X, torch.zeros(X.shape[0], As.shape[1] - X.shape[1], 1, device=device)), dim=1)
+    lb = torch.cat((lbxs, lbus), dim=1)
+    ub = torch.cat((ubxs, ubus), dim=1)
+
+    # Initialize model
+    model, optimizer, train_step = setup_model(
         hyperparameters=hyperparameters,
         A=As,
         X=X,
-        b=Xfull,
+        b=X_full,
         lb=lb,
         ub=ub,
         batched_objective=batched_objective,
-    )
-    tx = optax.adam(LEARNING_RATE)
-    state = train_state.TrainState.create(
-        apply_fn=model.apply, params=params["params"], tx=tx
+        device=device,
     )
 
-    N_EPOCHS = hyperparameters["n_epochs"]
-    eval_every = 1
-    start = time.time()
-    trainig_losses = []
-    validation_losses = []
-    eqcvs = []
-    ineqcvs = []
+    if use_saved:
+        if results_folder is None:
+            raise ValueError("Please provide the results folder name to load saved parameters.")
+        # Load saved model
+        model_path = pathlib.Path(__file__).parent / "results" / results_folder / "model.pt"
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+    else:
+        n_epochs = hyperparameters["n_epochs"]
+        train_losses, val_losses, eqcvs, ineqcvs = [], [], [], []
 
-    with (
-        Logger(run_name=run_name, project_name="hcnn_toy_mpc") as data_logger,
-        GracefulShutdown("Stop detected, finishing epoch...") as g,
-    ):
-        data_logger.run.config.update(hyperparameters)
-        for step in (pbar := tqdm(range(N_EPOCHS))):
-            if g.stop:
-                break
-            epoch_loss = []
-            batch_sizes = []
-            start_epoch_time = time.time()
-            for batch in train_loader:
-                X_batch, _ = batch
-                X_batch_full = jnp.concatenate(
-                    (
-                        X_batch,
-                        jnp.zeros(
-                            (X_batch.shape[0], As.shape[1] - X_batch.shape[1], 1)
-                        ),
-                    ),
-                    axis=1,
-                )
-                loss, state = train_step(
-                    state,
-                    X_batch[:, :, 0],
-                    X_batch_full,
-                )
-                batch_sizes.append(X_batch.shape[0])
-                epoch_loss.append(loss)
-            weighted_epoch_loss = sum(
-                el * bs for el, bs in zip(epoch_loss, batch_sizes)
-            ) / sum(batch_sizes)
-            trainig_losses.append(weighted_epoch_loss)
-            pbar.set_description(f"Train Loss: {weighted_epoch_loss:.5f}")
-            epoch_time = time.time() - start_epoch_time
+        with (
+            Logger(run_name=run_name, project_name="hcnn_toy_mpc") as data_logger,
+            GracefulShutdown("Stop detected, finishing epoch...") as g,
+        ):
+            data_logger.run.config.update(hyperparameters)
 
-            if step % eval_every == 0:
-                start_evaluation_time = time.time()
-                # TODO: Use some of the evaluate functions?
-                for X_valid, valid_obj in valid_loader:
-                    X_valid_full = jnp.concatenate(
-                        (
-                            X_valid,
-                            jnp.zeros(
-                                (X_valid.shape[0], As.shape[1] - X_valid.shape[1], 1)
-                            ),
-                        ),
-                        axis=1,
+            for epoch in (pbar := tqdm(range(n_epochs))):
+                if g.stop:
+                    break
+                model.train()
+                epoch_losses, batch_sizes = [], []
+
+                start_epoch_time = time.time()
+                for X_batch, _ in train_loader:
+                    X_batch = X_batch.to(device)
+                    X_batch_full = torch.cat(
+                        (X_batch, torch.zeros(X_batch.shape[0], As.shape[1] - X_batch.shape[1], 1, device=device)), dim=1
                     )
-                    predictions = state.apply_fn(
-                        {"params": state.params},
-                        X_valid[:, :, 0],
-                        X_valid_full,
-                        test=True,
-                    )
-                    validation_loss = batched_objective(predictions)
-                    eqcv = jnp.abs(
-                        As[0] @ predictions.reshape(-1, Y_DIM, 1) - X_valid_full
-                    ).max()
-                    ineqcvub = jnp.max(
-                        jnp.maximum(predictions.reshape(-1, Y_DIM, 1) - ub, 0), axis=1
-                    )
-                    ineqcvlb = jnp.max(
-                        jnp.maximum(lb - predictions.reshape(-1, Y_DIM, 1), 0), axis=1
-                    )
-                    ineqcv = jnp.maximum(ineqcvub, ineqcvlb).mean()
-                    eqcvs.append(eqcv)
-                    ineqcvs.append(ineqcv)
-                    validation_losses.append(validation_loss.mean())
-                    eval_time = time.time() - start_evaluation_time
-                    pbar.set_postfix(
-                        {
-                            "eqcv": f"{eqcv:.5f}",
-                            "ineqcv": f"{ineqcv:.5f}",
-                            "Valid. Loss:": f"{validation_loss.mean():.5f}",
-                        }
-                    )
-                    data_logger.log(
-                        step,
-                        {
+                    loss = train_step(model, optimizer, X_batch[:, :, 0], X_batch_full)
+                    epoch_losses.append(loss)
+                    batch_sizes.append(X_batch.shape[0])
+
+                weighted_epoch_loss = sum(l * s for l, s in zip(epoch_losses, batch_sizes)) / sum(batch_sizes)
+                train_losses.append(weighted_epoch_loss)
+                epoch_time = time.time() - start_epoch_time
+                pbar.set_description(f"Train Loss: {weighted_epoch_loss:.5f}")
+
+                # Validation per epoch
+                model.eval()
+                with torch.no_grad():
+                    for X_valid, valid_obj in valid_loader:
+                        X_valid = X_valid.to(device)
+                        valid_obj = valid_obj.to(device)
+                        X_valid_full = torch.cat(
+                            (X_valid, torch.zeros(X_valid.shape[0], As.shape[1] - X_valid.shape[1], 1, device=device)),
+                            dim=1
+                        )
+                        predictions = model(X_valid[:, :, 0], X_valid_full, test=True)
+                        val_loss = batched_objective(predictions)
+                        eqcv = torch.abs(As[0] @ predictions.reshape(-1, Y_DIM, 1) - X_valid_full).amax()
+                        pred_reshaped = predictions.reshape(-1, Y_DIM, 1)
+                        ineqcv = torch.maximum(torch.amax(pred_reshaped - ub, dim=1),
+                                               torch.amax(lb - pred_reshaped, dim=1)).mean()
+
+                        data_logger.log(epoch, {
                             "weighted_epoch_loss": weighted_epoch_loss,
                             "epoch_training_time": epoch_time,
-                            "validation_objective_mean": validation_loss.mean(),
-                            "validation_average_rs": (
-                                (validation_loss - valid_obj) / jnp.abs(valid_obj)
-                            ).mean(),
-                            "validation_cv": jnp.maximum(ineqcv, eqcv),
-                            "validation_time": eval_time,
-                        },
-                    )
-        training_time = time.time() - start
-        print(f"Training time: {training_time:.5f} seconds")
+                            "validation_objective_mean": val_loss.mean().item(),
+                            "validation_average_rs": ((val_loss - valid_obj) / valid_obj.abs()).mean().item(),
+                            "validation_cv": torch.max(eqcv, ineqcv).item(),
+                            "validation_time": time.time() - start_epoch_time,
+                        })
 
-        if PLOT_TRAINING:
-            plot_training(
-                train_loader,
-                valid_loader,
-                trainig_losses,
-                validation_losses,
-                eqcvs,
-                ineqcvs,
-            )
-        _ = evaluate_hcnn(
-            loader=valid_loader,
-            state=state,
-            batched_objective=batched_objective,
-            prefix="Validation",
-            A=As,
-            lb=lb,
-            ub=ub,
-            cv_tol=1e-3,
-            single_instance=False,
-        )
-        opt_obj, hcnn_obj, eq_cv, ineq_cv, ineq_perc, mean_inf_time, std_inf_time = (
-            evaluate_hcnn(
-                loader=test_loader,
-                state=state,
-                batched_objective=batched_objective,
-                prefix="Test",
-                A=As,
-                lb=lb,
-                ub=ub,
-                cv_tol=1e-3,
-                time_evals=10,
-                single_instance=False,
-            )
-        )
-        _, _, _, _, _, mean_inf_time_single, std_inf_time_single = evaluate_hcnn(
-            loader=test_loader,
-            state=state,
-            batched_objective=batched_objective,
-            prefix="Test",
-            A=As,
-            lb=lb,
-            ub=ub,
-            cv_tol=1e-3,
-            time_evals=10,
-            single_instance=True,
-        )
+                        pbar.set_postfix({
+                            "eqcv": f"{eqcv.item():.5f}",
+                            "ineqcv": f"{ineqcv.item():.5f}",
+                            "Valid. Loss": f"{val_loss.mean().item():.5f}"
+                        })
 
-        # Log summary metrics for wandb
-        rs = (hcnn_obj - opt_obj) / jnp.abs(opt_obj)
-        cv = jnp.maximum(eq_cv, ineq_cv)
-        cvthres = 1e-3
-        data_logger.run.summary.update(
-            {
-                "Average RS Test": jnp.mean(rs),
-                "Max CV Test": jnp.max(cv),
-                "Percentage CV < tol": (1 - jnp.mean(cv > cvthres)) * 100,
-                "Average Single Inference Time": mean_inf_time_single,
-                "Average Batch Inference Time": mean_inf_time,
-            }
-        )
+        if SAVE_RESULTS:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            results_folder = pathlib.Path(__file__).parent / "results" / timestamp
+            results_folder.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), results_folder / "model.pt")
+            np.savez(results_folder / "results.npz", train_losses=train_losses, val_losses=val_losses)
 
-    if SAVE_RESULTS:
-        current_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_filename = "results.npz"
-        timestamp_folder = pathlib.Path(__file__).parent / "results" / current_timestamp
-        timestamp_folder.mkdir(parents=True, exist_ok=True)
-        results_path = timestamp_folder / results_filename
-        # Save the inference time and trajectories
-        jnp.savez(
-            file=results_path,
-            opt_obj=opt_obj,
-            hcnn_obj=hcnn_obj,
-            eq_cv=eq_cv,
-            ineq_cv=ineq_cv,
-            ineq_perc=ineq_perc,
-            inference_time_mean=mean_inf_time,
-            inference_time_std=std_inf_time,
-            config_path=config_path,
-            **hyperparameters,
-        )
-        # Save the network parameters for reusing
-        params_filename = "params.msgpack"
-        params_path = timestamp_folder / params_filename
-        with open(params_path, "wb") as f:
-            f.write(to_bytes(state.params))
+    # Final evaluation
+    opt_obj, hcnn_obj, eq_cv, ineq_cv, ineq_perc, mean_inf_time, std_inf_time = evaluate_hcnn(
+        test_loader, model, batched_objective, As, lb, ub, "Test", device
+    )
 
-    return state
+    _, _, _, _, _, mean_inf_time_single, std_inf_time_single = evaluate_hcnn(
+        test_loader, model, batched_objective, As, lb, ub, "Test", device, single_instance=True
+    )
 
+    # Log summary metrics
+    rs = (hcnn_obj - opt_obj) / torch.abs(opt_obj)
+    cv = torch.max(eq_cv, ineq_cv)
+    cv_thres = 1e-3
+    with Logger(run_name=run_name, project_name="hcnn_toy_mpc") as data_logger:
+        data_logger.run.summary.update({
+            "Average RS Test": rs.mean().item(),
+            "Max CV Test": cv.max().item(),
+            "Percentage CV < tol": (1 - (cv > cv_thres).float().mean().item()) * 100,
+            "Average Single Inference Time": mean_inf_time_single,
+            "Average Batch Inference Time": mean_inf_time,
+        })
+
+    if PLOT_TRAINING and not use_saved:
+        plot_training(train_loader, valid_loader, train_losses, val_losses, eqcvs, ineqcvs)
+
+    return model
+
+
+# ============================================================
+#   SCRIPT ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run HCNN on toy MPC problem (PyTorch version, GPU ready).")
+    parser.add_argument("--filename", type=str, required=True, help="Filename of dataset (.npz)")
+    parser.add_argument("--config", type=str, default="toy_MPC", help="Configuration file for HCNN hyperparameters")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--plot_training", action=argparse.BooleanOptionalAction, default=False, help="Plot training curves")
+    parser.add_argument("--save_results", action=argparse.BooleanOptionalAction, default=True, help="Save results")
+    parser.add_argument("--use_saved", action="store_true", help="Use saved network to evaluate")
+    parser.add_argument("--results_folder", type=str, default=None, help="Folder containing saved model/results")
+    args = parser.parse_args()
 
-    def parse_args():
-        """Parse CLI arguments."""
-        parser = argparse.ArgumentParser(description="Run HCNN on toy MPC problem.")
-        parser.add_argument(
-            "--filename",
-            type=str,
-            required=True,
-            help="Filename of dataset.",
-        )
-        parser.add_argument(
-            "--config",
-            type=str,
-            default="toy_MPC.yaml",
-            help="Configuration file for HCNN hyperparameters.",
-        )
-        parser.add_argument(
-            "--seed", type=int, default=42, help="Seed for training HCNN."
-        )
-        parser.add_argument(
-            "--plot-training",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-            help="Plot training curves.",
-        )
-        parser.add_argument(
-            "--save-results", action="store_true", help="Save the results."
-        )
-        parser.add_argument(
-            "--no-save-results",
-            action="store_false",
-            dest="save_results",
-            help="Don't save the results.",
-        )
-        parser.add_argument(
-            "--use-saved",
-            action="store_true",
-            help="Use saved network to plot trajectories and print results.",
-        )
-        parser.add_argument(
-            "--results-folder",
-            type=str,
-            required=False,
-            default=None,
-            help="Name (suffix) of the results file and params file.",
-        )
-        parser.add_argument(
-            "--jax-loader",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help="Use the jax loader or not. If not, use pytorch loader.",
-        )
-        parser.set_defaults(save_results=True)
-        parser.set_defaults(use_saved=False)
-        return parser.parse_args()
+    run_name = f"toy_MPC_{datetime.datetime.now():%Y%m%d_%H%M%S}"
 
-    # Parse arguments
-    args = parse_args()
-    filepath = pathlib.Path(__file__).parent.resolve() / "datasets" / args.filename
-    config_path = (
-        pathlib.Path(__file__).parent.parent.resolve()
-        / "configs"
-        / (args.config + ".yaml")
+    config_path = pathlib.Path(__file__).parent.parent.resolve() / "configs" / (args.config + ".yaml")
+
+    main(
+        filepath=args.filename,
+        config_path=config_path,
+        SEED=args.seed,
+        PLOT_TRAINING=args.plot_training,
+        SAVE_RESULTS=args.save_results,
+        use_saved=args.use_saved,
+        results_folder=args.results_folder,
+        run_name=run_name,
     )
-    SEED = args.seed
-    torch.manual_seed(SEED)
-    use_jax_loader = args.jax_loader
-    run_name = f"toy_MPC_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    if not args.use_saved:
-        _ = main(
-            filepath=filepath,
-            config_path=config_path,
-            SEED=SEED,
-            PLOT_TRAINING=args.plot_training,
-            SAVE_RESULTS=args.save_results,
-            use_jax_loader=use_jax_loader,
-            run_name=run_name,
-        )
-    else:
-        if args.results_folder is None:
-            raise ValueError("Please provide the name of the results file.")
-
-        hyperparameters = load_configuration(config_path)
-        key = jax.random.PRNGKey(SEED)
-        loader_key, key = jax.random.split(key, 2)
-        # Parse data
-        (
-            As,
-            lbxs,
-            ubxs,
-            lbus,
-            ubus,
-            xhat,
-            alpha,
-            T,
-            base_dim,
-            X,
-            train_loader,
-            valid_loader,
-            test_loader,
-            batched_objective,
-        ) = load_data(
-            filepath=filepath,
-            val_split=hyperparameters["val_split"],
-            test_split=hyperparameters["test_split"],
-            batch_size=hyperparameters["batch_size"],
-            rng_key=loader_key,
-            use_jax_loader=use_jax_loader,
-        )
-        Y_DIM = As.shape[2]
-        # The X contains only the initial conditions.
-        # To properly define the equality constraints we need to append zeros
-        Xfull = jnp.concatenate(
-            (X, jnp.zeros((X.shape[0], As.shape[1] - X.shape[1], 1))), axis=1
-        )
-        dimx = lbxs.shape[1]
-        dimu = lbus.shape[1]
-        lb = jnp.concatenate((lbxs, lbus), axis=1)
-        ub = jnp.concatenate((ubxs, ubus), axis=1)
-        model, params, train_step = setup_model(
-            rng_key=key,
-            hyperparameters=hyperparameters,
-            A=As,
-            X=X,
-            b=Xfull,
-            lb=lb,
-            ub=ub,
-            batched_objective=batched_objective,
-        )
-
-        params_filepath = (
-            pathlib.Path(__file__).parent.resolve()
-            / "results"
-            / args.results_folder
-            / ("params.msgpack")
-        )
-        # Load saved parameters.
-        with open(params_filepath, "rb") as f:
-            loaded_bytes = f.read()
-        from flax.serialization import (  # Import here if not already imported.
-            from_bytes,
-        )
-
-        restored_params = from_bytes(params["params"], loaded_bytes)
-
-        # Create the optimizer and state.
-        tx = optax.adam(learning_rate=hyperparameters["learning_rate"])
-        state = train_state.TrainState.create(
-            apply_fn=model.apply, params=restored_params, tx=tx
-        )
-
-        trajectories_pred, trajectories_cp = generate_trajectories(
-            state=state,
-            As=As,
-            lbxs=lbxs,
-            ubxs=ubxs,
-            lbus=lbus,
-            ubus=ubus,
-            alpha=alpha,
-            base_dim=base_dim,
-            Y_DIM=Y_DIM,
-            dimx=dimx,
-            xhat=xhat,
-            T=T,
-            lb=lb,
-            ub=ub,
-        )
-
-        # Print results
-        results_filepath = (
-            pathlib.Path(__file__).parent.resolve()
-            / "results"
-            / args.results_folder
-            / "results.npz"
-        )
-        results = jnp.load(results_filepath)
-        print(
-            f"Inference Time: {results['inference_time_mean']:.5f} ± "
-            f"{results['inference_time_std']:.5f} s"
-        )
-        rel_suboptimality = (results["hcnn_obj"] - results["opt_obj"]) / results[
-            "opt_obj"
-        ]
-        print(f"Average Relative Suboptimality: {rel_suboptimality.mean():.5%}")
-        print(
-            f"Percentage of ineq. constraint satisfaction: {results['ineq_perc']:.2f}%"
-        )
-
-        if True:
-            trajectories_path = (
-                pathlib.Path(__file__).parent.resolve()
-                / "results"
-                / args.results_folder
-                / "trajectories"
-            )
-            trajectories_path.mkdir(parents=True, exist_ok=True)
-            for ii in range(trajectories_pred.shape[0]):
-                xpred = (
-                    trajectories_pred[ii, :][:dimx].reshape((T + 1, base_dim)) / 20.0
-                    + 0.5
-                )
-                xgt = (
-                    trajectories_cp[ii, :][:dimx].reshape((T + 1, base_dim)) / 20.0
-                    + 0.5
-                )
-                # Save trajectory to CSV file
-                # Create output directory if not exists
-                # Stack the columns:
-                # x (xpred[:,0]), y (xpred[:,1]), xgt (xgt[:,0]), ygt (xgt[:,1])
-                data = np.column_stack((xpred[:, 0], xpred[:, 1], xgt[:, 0], xgt[:, 1]))
-                csv_filename = trajectories_path / f"trajectory_{ii+1}.csv"
-                np.savetxt(
-                    csv_filename,
-                    data,
-                    delimiter=",",
-                    header="x,y,xgt,ygt",
-                    comments="",
-                    fmt="%.5f",
-                )

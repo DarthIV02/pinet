@@ -1,8 +1,7 @@
-"""Module for the Alternating Direction Method of Multipliers (ADMM) solver."""
+"""Module for the Alternating Direction Method of Multipliers (ADMM) solver (PyTorch version)."""
 
-from typing import Callable
-
-import jax.numpy as jnp
+from typing import Callable, Tuple
+import torch
 
 from pinet.constraints import (
     AffineInequalityConstraint,
@@ -14,27 +13,29 @@ from pinet.dataclasses import ProjectionInstance
 
 
 def initialize(
-    yraw: jnp.ndarray,
+    yraw: ProjectionInstance,
     ineq_constraint: AffineInequalityConstraint,
     box_constraint: BoxConstraint,
     dim: int,
     dim_lifted: int,
-    d_r: jnp.ndarray,
+    d_r: torch.Tensor,
 ) -> ProjectionInstance:
-    """Initialize the ADMM solver state.
+    """Initialize the ADMM solver state (GPU-ready, PyTorch version).
 
     Args:
-        yraw (jnp.ndarray): Point to be projected. Shape (batch_size, dimension, 1).
+        yraw (ProjectionInstance): Point to be projected. Shape (batch_size, dimension, 1)
         ineq_constraint (AffineInequalityConstraint): Inequality constraint.
         box_constraint (BoxConstraint): Box constraint.
         dim (int): Dimension of the original problem.
         dim_lifted (int): Dimension of the lifted problem.
-        d_r (jnp.ndarray): Scaling factor for the lifted dimension.
+        d_r (torch.Tensor): Scaling factor for the lifted dimension.
 
     Returns:
         ProjectionInstance: Initial state for the ADMM solver.
     """
-    # Preprocess
+    device = yraw.x.device
+
+    # Preprocess equality constraints
     if yraw.eq is not None:
         if yraw.eq.A is not None:
             # Lift the equality constraint
@@ -44,55 +45,60 @@ def initialize(
                 box_constraint=box_constraint,
             )
             lifted_eq_constraint, _, _ = parser.parse(method="pinv")
+
             yraw = yraw.update(
                 eq=yraw.eq.update(
-                    A=lifted_eq_constraint.A, Apinv=lifted_eq_constraint.Apinv
+                    A=lifted_eq_constraint.A,
+                    Apinv=lifted_eq_constraint.Apinv,
                 )
             )
 
         if yraw.eq.b is not None:
             b_lifted = (
-                jnp.concatenate(
+                torch.cat(
                     [
                         yraw.eq.b,
-                        jnp.zeros(shape=(yraw.eq.b.shape[0], dim_lifted - dim, 1)),
+                        torch.zeros(
+                            (yraw.eq.b.shape[0], dim_lifted - dim, 1), device=device
+                        ),
                     ],
-                    axis=1,
+                    dim=1,
                 )
                 * d_r
             )
             yraw = yraw.update(eq=yraw.eq.update(b=b_lifted))
 
-    # Return updated value
-    return yraw.update(x=jnp.zeros((yraw.x.shape[0], dim_lifted, 1)))
+    # Initialize x in the lifted dimension
+    return yraw.update(x=torch.zeros((yraw.x.shape[0], dim_lifted, 1), device=device))
 
 
 def build_iteration_step(
     eq_constraint: EqualityConstraint,
     box_constraint: BoxConstraint,
     dim: int,
-    scale: jnp.ndarray = 1.0,
-) -> tuple[
-    Callable[[ProjectionInstance, jnp.ndarray, float, float], ProjectionInstance],
-    Callable[[ProjectionInstance], jnp.ndarray],
+    scale: torch.Tensor = torch.tensor(1.0),
+) -> Tuple[
+    Callable[[ProjectionInstance, ProjectionInstance, float, float], ProjectionInstance],
+    Callable[[ProjectionInstance], ProjectionInstance],
 ]:
-    """Build the iteration and result retrieval step for the ADMM solver.
+    """Build the iteration and result retrieval step for the ADMM solver (GPU-ready).
 
-    See https://web.stanford.edu/~boyd/papers/pdf/admm_distr_stats.pdf for details.
     Args:
         eq_constraint (EqualityConstraint): (Lifted) Equality constraint.
         box_constraint (BoxConstraint): (Lifted) Box constraint.
         dim (int): Dimension of the original problem.
-        scale (jnp.ndarray): Scaling of primal variables.
+        scale (torch.Tensor): Scaling of primal variables.
 
     Returns:
         tuple[
-            Callable[[ProjectionInstance, jnp.ndarray, float, float], ProjectionInstance],
+            Callable[[ProjectionInstance, ProjectionInstance, float, float], ProjectionInstance],
             Callable[[ProjectionInstance], ProjectionInstance]
         ]:
             The first element is the iteration step,
             the second element is the result retrieval step.
     """
+    device = eq_constraint.A.device if hasattr(eq_constraint, "A") else torch.device("cpu")
+    scale = scale.to(device)
 
     def iteration_step(
         sk: ProjectionInstance,
@@ -103,30 +109,41 @@ def build_iteration_step(
         """One iteration of the ADMM solver.
 
         Args:
-            sk (ProjectionInstance): State iterate for the ADMM solver.
-                .x of Shape (batch_size, lifted_dimension, 1).
-            yraw (ProjectionInstance):
-                Point to be projected. .x of Shape (batch_size, dimension, 1).
-            sigma (float, optional): ADMM parameter.
-            omega (float, optional): ADMM parameter.
+            sk (ProjectionInstance): Current ADMM state.
+                .x shape (batch_size, lifted_dimension, 1)
+            yraw (ProjectionInstance): Point to be projected.
+                .x shape (batch_size, dimension, 1)
+            sigma (float): ADMM parameter.
+            omega (float): ADMM parameter.
 
         Returns:
-            jnp.ndarray: Next state iterate of the ADMM solver.
+            ProjectionInstance: Next ADMM state iterate.
         """
+        device = sk.x.device
+
+        # 1. Equality projection
         zk = eq_constraint.project(sk)
-        # Reflection
+
+        # 2. Reflection step
         reflect = 2 * zk.x - sk.x
-        tobox = jnp.concatenate(
+
+        # 3. Compute input for box projection
+        tobox = torch.cat(
             (
                 (2 * sigma * scale * yraw.x + reflect[:, :dim, :])
                 / (1 + 2 * sigma * scale**2),
                 reflect[:, dim:, :],
             ),
-            axis=1,
+            dim=1,
         )
+
+        # 4. Box projection
         tk = box_constraint.project(sk.update(x=tobox))
+
+        # 5. ADMM update
         sk = sk.update(x=sk.x + omega * (tk.x - zk.x))
+
         return sk
 
-    # The second element is used to extract the projection from the auxiliary
-    return (iteration_step, lambda y: eq_constraint.project(y))
+    # Second function: extract the projected result
+    return iteration_step, lambda y: eq_constraint.project(y)

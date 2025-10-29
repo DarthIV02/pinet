@@ -1,14 +1,13 @@
-"""Abstract class for constraint sets."""
+"""Abstract class for constraint sets (PyTorch version)."""
 
-from abc import abstractmethod
-
-import jax.numpy as jnp
+from abc import ABC, abstractmethod
+import torch
 
 from pinet.dataclasses import ProjectionInstance
 
 
-class Constraint:
-    """Abstract class for constraint sets."""
+class Constraint(ABC):
+    """Abstract base class for constraint sets."""
 
     @abstractmethod
     def project(self, yraw: ProjectionInstance) -> ProjectionInstance:
@@ -20,18 +19,20 @@ class Constraint:
         Returns:
             ProjectionInstance: The projected input.
         """
+        pass
 
     @abstractmethod
-    def cv(self, yraw: ProjectionInstance) -> jnp.ndarray:
+    def cv(self, yraw: ProjectionInstance) -> torch.Tensor:
         """Compute the constraint violation.
 
         Args:
             yraw (ProjectionInstance): ProjectionInstance to evaluate.
 
         Returns:
-            jnp.ndarray: The constraint violation for each point in the batch.
+            torch.Tensor: The constraint violation for each point in the batch.
                 Shape (batch_size, 1, 1).
         """
+        pass
 
     @property
     @abstractmethod
@@ -41,6 +42,7 @@ class Constraint:
         Returns:
             int: The dimension of the constraint set.
         """
+        pass
 
     @property
     @abstractmethod
@@ -50,3 +52,4 @@ class Constraint:
         Returns:
             int: The number of constraints.
         """
+        pass
