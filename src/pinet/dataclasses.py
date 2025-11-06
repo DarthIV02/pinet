@@ -1,4 +1,4 @@
-"""This file contains dataclasses used to encapsulate inputs for the Pinet layer (PyTorch version)."""
+"""This file contains dataclasses used to encapsulate inputs for the Pinet layer (PyTorch version, double precision)."""
 
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -32,11 +32,11 @@ class EqualityConstraintsSpecification:
         return replace(self, **kwargs)
 
     def to(self, device: torch.device) -> "EqualityConstraintsSpecification":
-        """Move tensors to a given device (e.g., GPU)."""
+        """Move tensors to a given device (e.g., GPU) and ensure double precision."""
         return EqualityConstraintsSpecification(
-            b=self.b.to(device) if self.b is not None else None,
-            A=self.A.to(device) if self.A is not None else None,
-            Apinv=self.Apinv.to(device) if self.Apinv is not None else None,
+            b=self.b.to(device=device, dtype=torch.float64) if self.b is not None else None,
+            A=self.A.to(device=device, dtype=torch.float64) if self.A is not None else None,
+            Apinv=self.Apinv.to(device=device, dtype=torch.float64) if self.Apinv is not None else None,
         )
 
 
@@ -59,11 +59,11 @@ class BoxConstraintSpecification:
         return replace(self, **kwargs)
 
     def to(self, device: torch.device) -> "BoxConstraintSpecification":
-        """Move tensors to a given device (e.g., GPU)."""
+        """Move tensors to a given device (e.g., GPU) and ensure double precision."""
         return BoxConstraintSpecification(
-            lb=self.lb.to(device) if self.lb is not None else None,
-            ub=self.ub.to(device) if self.ub is not None else None,
-            mask=self.mask.to(device) if self.mask is not None else None,
+            lb=self.lb.to(device=device, dtype=torch.float64) if self.lb is not None else None,
+            ub=self.ub.to(device=device, dtype=torch.float64) if self.ub is not None else None,
+            mask=self.mask.to(device=device) if self.mask is not None else None,  # boolean mask stays same dtype
         )
 
     def validate(self) -> None:
@@ -136,9 +136,9 @@ class ProjectionInstance:
         return replace(self, **kwargs)
 
     def to(self, device: torch.device) -> "ProjectionInstance":
-        """Move tensors to a given device (e.g., GPU)."""
+        """Move tensors to a given device (e.g., GPU) and ensure double precision."""
         return ProjectionInstance(
-            x=self.x.to(device),
+            x=self.x.to(device=device, dtype=torch.float64),
             eq=self.eq.to(device) if self.eq is not None else None,
             box=self.box.to(device) if self.box is not None else None,
         )

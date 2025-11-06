@@ -1,4 +1,4 @@
-"""Box constraint module (PyTorch version)."""
+"""Box constraint module (PyTorch version, double precision)."""
 
 import torch
 from pinet.dataclasses import BoxConstraintSpecification, ProjectionInstance
@@ -20,8 +20,12 @@ class BoxConstraint(Constraint):
             box_spec (BoxConstraintSpecification): Specification of the box constraint.
                 For variable bounds, provide example bounds.
         """
-        self.lb = box_spec.lb
-        self.ub = box_spec.ub
+        self.lb = (
+            box_spec.lb.double() if box_spec.lb is not None else None
+        )
+        self.ub = (
+            box_spec.ub.double() if box_spec.ub is not None else None
+        )
         self.mask = box_spec.mask
 
         # Determine dimension
@@ -29,9 +33,12 @@ class BoxConstraint(Constraint):
             self.lb.shape[1] if self.lb is not None else self.ub.shape[1]
         )
 
-        # Scale factor placeholder
-        self.scale = torch.ones((1, self._dim, 1),
-                                device=(self.lb.device if self.lb is not None else "cpu"))
+        # Scale factor placeholder (double precision)
+        self.scale = torch.ones(
+            (1, self._dim, 1),
+            device=(self.lb.device if self.lb is not None else "cpu"),
+            dtype=torch.float64,
+        )
 
         # Default mask: all dimensions active
         if self.mask is None:
@@ -51,20 +58,28 @@ class BoxConstraint(Constraint):
             (lb, ub, mask): Tensors for lower/upper bounds and active dimension mask.
         """
         lb = (
-            (yraw.box.lb * self.scale)
+            (yraw.box.lb.double() * self.scale)
             if yraw.box and yraw.box.lb is not None
-            else self.lb
+            else (self.lb.double() if self.lb is not None else None)
         )
         ub = (
-            (yraw.box.ub * self.scale)
+            (yraw.box.ub.double() * self.scale)
             if yraw.box and yraw.box.ub is not None
-            else self.ub
+            else (self.ub.double() if self.ub is not None else None)
         )
         mask = yraw.box.mask if yraw.box and yraw.box.mask is not None else self.mask
 
         device = yraw.x.device
-        lb = lb.to(device) if lb is not None else -torch.inf * torch.ones_like(ub)
-        ub = ub.to(device) if ub is not None else torch.inf * torch.ones_like(lb)
+        lb = (
+            lb.to(device, dtype=torch.float64)
+            if lb is not None
+            else -torch.inf * torch.ones_like(ub, dtype=torch.float64)
+        )
+        ub = (
+            ub.to(device, dtype=torch.float64)
+            if ub is not None
+            else torch.inf * torch.ones_like(lb, dtype=torch.float64)
+        )
         mask = mask.to(device)
 
         return lb, ub, mask
@@ -81,8 +96,8 @@ class BoxConstraint(Constraint):
         lb, ub, mask = self.get_params(yraw)
 
         # Apply projection only on masked dimensions
-        x_proj = yraw.x.clone()
-        x_proj[:, mask, :] = torch.clamp(yraw.x[:, mask, :], lb, ub)
+        x_proj = yraw.x.clone().double()
+        x_proj[:, mask, :] = torch.clamp(yraw.x[:, mask, :].double(), lb, ub)
         return yraw.update(x=x_proj)
 
     def cv(self, y: ProjectionInstance) -> torch.Tensor:
@@ -96,12 +111,12 @@ class BoxConstraint(Constraint):
                 Shape (batch_size, 1, 1)
         """
         lb, ub, mask = self.get_params(y)
-        x_masked = y.x[:, mask, :]
+        x_masked = y.x[:, mask, :].double()
 
         cv_ub = torch.max(x_masked - ub, dim=1, keepdim=True).values
         cv_lb = torch.max(lb - x_masked, dim=1, keepdim=True).values
         cvs = torch.maximum(cv_ub, cv_lb)
-        return torch.maximum(cvs, torch.zeros_like(cvs))
+        return torch.maximum(cvs, torch.zeros_like(cvs, dtype=torch.float64))
 
     @property
     def dim(self) -> int:

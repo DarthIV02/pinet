@@ -1,4 +1,4 @@
-"""Parser of constraints to lifted representation module (PyTorch version)."""
+"""Parser of constraints to lifted representation module (PyTorch version, double precision)."""
 
 from typing import Optional
 import torch
@@ -10,7 +10,7 @@ from .box import BoxConstraint
 
 
 class ConstraintParser:
-    """Parse constraints into a lifted representation.
+    """Parse constraints into a lifted representation (double precision).
 
     Converts equality, inequality, and box constraints into a unified lifted form
     suitable for optimization and projection methods.
@@ -22,13 +22,7 @@ class ConstraintParser:
         ineq_constraint: Optional[AffineInequalityConstraint],
         box_constraint: Optional[BoxConstraint] = None,
     ) -> None:
-        """Initialize the constraint parser.
-
-        Args:
-            eq_constraint (EqualityConstraint): An equality constraint.
-            ineq_constraint (AffineInequalityConstraint): An inequality constraint.
-            box_constraint (BoxConstraint): A box constraint.
-        """
+        """Initialize the constraint parser (double precision)."""
         if ineq_constraint is None:
             # No lifting needed
             self.parse = lambda method=None: (eq_constraint, box_constraint, lambda y: y)
@@ -39,14 +33,15 @@ class ConstraintParser:
             if hasattr(ineq_constraint, "C")
             else torch.device("cpu")
         )
+        dtype = torch.float64
 
         self.dim = ineq_constraint.dim
 
         # Default equality constraint if not provided
         if eq_constraint is None:
             eq_constraint = EqualityConstraint(
-                A=torch.empty((1, 0, self.dim), device=device),
-                b=torch.empty((1, 0, 1), device=device),
+                A=torch.empty((1, 0, self.dim), device=device, dtype=dtype),
+                b=torch.empty((1, 0, 1), device=device, dtype=dtype),
                 method=None,
                 var_b=False,
                 var_A=False,
@@ -81,15 +76,9 @@ class ConstraintParser:
     def parse(
         self, method: Optional[str] = "pinv"
     ) -> tuple[EqualityConstraint, BoxConstraint, callable]:
-        """Parse constraints into a lifted representation.
-
-        Args:
-            method (Optional[str]): Method used for solving linear systems ("pinv", None).
-
-        Returns:
-            tuple: (eq_lifted, box_lifted, lift_fn)
-        """
+        """Parse constraints into a lifted representation (double precision)."""
         device = self.eq_constraint.A.device
+        dtype = torch.float64
 
         # Determine batch size for combining equality and inequality constraints
         mbAC = max(self.eq_constraint.A.shape[0], self.ineq_constraint.C.shape[0])
@@ -98,10 +87,11 @@ class ConstraintParser:
         first_row_batched = torch.tile(
             torch.cat(
                 [
-                    self.eq_constraint.A,
+                    self.eq_constraint.A.to(dtype=dtype),
                     torch.zeros(
                         (self.eq_constraint.A.shape[0], self.n_eq, self.n_ineq),
                         device=device,
+                        dtype=dtype,
                     ),
                 ],
                 dim=2,
@@ -112,9 +102,9 @@ class ConstraintParser:
         second_row_batched = torch.tile(
             torch.cat(
                 [
-                    self.ineq_constraint.C,
+                    self.ineq_constraint.C.to(dtype=dtype),
                     -torch.tile(
-                        torch.eye(self.n_ineq, device=device).reshape(
+                        torch.eye(self.n_ineq, device=device, dtype=dtype).reshape(
                             1, self.n_ineq, self.n_ineq
                         ),
                         (self.ineq_constraint.C.shape[0], 1, 1),
@@ -128,9 +118,11 @@ class ConstraintParser:
         A_lifted = torch.cat([first_row_batched, second_row_batched], dim=1)
         b_lifted = torch.cat(
             [
-                self.eq_constraint.b,
+                self.eq_constraint.b.to(dtype=dtype),
                 torch.zeros(
-                    (self.eq_constraint.b.shape[0], self.n_ineq, 1), device=device
+                    (self.eq_constraint.b.shape[0], self.n_ineq, 1),
+                    device=device,
+                    dtype=dtype,
                 ),
             ],
             dim=1,
@@ -156,8 +148,8 @@ class ConstraintParser:
 
             box_lifted = BoxConstraint(
                 BoxConstraintSpecification(
-                    lb=self.ineq_constraint.lb,
-                    ub=self.ineq_constraint.ub,
+                    lb=self.ineq_constraint.lb.to(dtype=dtype),
+                    ub=self.ineq_constraint.ub.to(dtype=dtype),
                     mask=box_mask,
                 )
             )
@@ -177,11 +169,11 @@ class ConstraintParser:
             lifted_lb = torch.cat(
                 [
                     torch.tile(
-                        self.box_constraint.lb,
+                        self.box_constraint.lb.to(dtype=dtype),
                         (mblb // self.box_constraint.lb.shape[0], 1, 1),
                     ),
                     torch.tile(
-                        self.ineq_constraint.lb,
+                        self.ineq_constraint.lb.to(dtype=dtype),
                         (mblb // self.ineq_constraint.lb.shape[0], 1, 1),
                     ),
                 ],
@@ -194,11 +186,11 @@ class ConstraintParser:
             lifted_ub = torch.cat(
                 [
                     torch.tile(
-                        self.box_constraint.ub,
+                        self.box_constraint.ub.to(dtype=dtype),
                         (mbub // self.box_constraint.ub.shape[0], 1, 1),
                     ),
                     torch.tile(
-                        self.ineq_constraint.ub,
+                        self.ineq_constraint.ub.to(dtype=dtype),
                         (mbub // self.ineq_constraint.ub.shape[0], 1, 1),
                     ),
                 ],
@@ -215,18 +207,28 @@ class ConstraintParser:
 
         # === Define lifting function ===
         def lift(y):
-            """Lift the input to the lifted dimension."""
+            """Lift the input to the lifted dimension (double precision)."""
             device = y.x.device
             y = y.update(
-                x=torch.cat([y.x, self.ineq_constraint.C @ y.x], dim=1)
+                x=torch.cat(
+                    [
+                        y.x.to(dtype=dtype),
+                        (self.ineq_constraint.C.to(dtype=dtype) @ y.x.to(dtype=dtype)),
+                    ],
+                    dim=1,
+                )
             )
             if self.eq_constraint.var_b:
                 y = y.update(
                     eq=y.eq.update(
                         b=torch.cat(
                             [
-                                y.eq.b,
-                                torch.zeros((y.x.shape[0], self.n_ineq, 1), device=device),
+                                y.eq.b.to(dtype=dtype),
+                                torch.zeros(
+                                    (y.x.shape[0], self.n_ineq, 1),
+                                    device=device,
+                                    dtype=dtype,
+                                ),
                             ],
                             dim=1,
                         )

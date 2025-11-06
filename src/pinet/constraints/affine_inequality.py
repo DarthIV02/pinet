@@ -1,4 +1,4 @@
-"""Affine inequality constraint module (PyTorch version)."""
+"""Affine inequality constraint module (PyTorch version, double precision)."""
 
 from typing import Optional
 import torch
@@ -8,7 +8,7 @@ from .base import Constraint
 
 
 class AffineInequalityConstraint(Constraint):
-    """Affine inequality constraint set.
+    """Affine inequality constraint set (double precision).
 
     The (affine) inequality constraint set is defined as:
         lb <= C @ x <= ub
@@ -21,9 +21,8 @@ class AffineInequalityConstraint(Constraint):
         lb: torch.Tensor,
         ub: torch.Tensor,
         device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
     ) -> None:
-        """Initialize the affine inequality constraint.
+        """Initialize the affine inequality constraint (double precision).
 
         Args:
             C (torch.Tensor): The matrix C in the inequality.
@@ -37,7 +36,8 @@ class AffineInequalityConstraint(Constraint):
         if device is None:
             device = C.device
 
-        # Move everything to the same device and dtype
+        # Move everything to the same device and double precision
+        dtype = torch.float64
         self.C = C.to(device=device, dtype=dtype)
         self.lb = lb.to(device=device, dtype=dtype)
         self.ub = ub.to(device=device, dtype=dtype)
@@ -68,7 +68,7 @@ class AffineInequalityConstraint(Constraint):
         """Project x onto the affine inequality constraint set.
 
         Args:
-            inp (ProjectionInstance): ProjectionInstance to projection.
+            inp (ProjectionInstance): ProjectionInstance to project.
                 The .x attribute is the point to project.
 
         Returns:
@@ -90,7 +90,7 @@ class AffineInequalityConstraint(Constraint):
         return self.C.shape[1]
 
     def cv(self, inp: ProjectionInstance) -> torch.Tensor:
-        """Compute the constraint violation.
+        """Compute the constraint violation (double precision).
 
         Args:
             inp (ProjectionInstance): ProjectionInstance to evaluate.
@@ -99,7 +99,7 @@ class AffineInequalityConstraint(Constraint):
             torch.Tensor: The constraint violation for each point in the batch.
                 Shape (batch_size, 1, 1).
         """
-        Cx = self.C @ inp.x  # Shape: (batch_size, n_constraints, 1)
+        Cx = self.C @ inp.x.double()  # Ensure input x is double
         cv_ub = torch.clamp(Cx - self.ub, min=0.0)
         cv_lb = torch.clamp(self.lb - Cx, min=0.0)
         cv = torch.maximum(cv_ub, cv_lb)  # Elementwise maximum

@@ -1,4 +1,4 @@
-"""Module for the Alternating Direction Method of Multipliers (ADMM) solver (PyTorch version)."""
+"""Module for the Alternating Direction Method of Multipliers (ADMM) solver (PyTorch version, double precision)."""
 
 from typing import Callable, Tuple
 import torch
@@ -20,7 +20,7 @@ def initialize(
     dim_lifted: int,
     d_r: torch.Tensor,
 ) -> ProjectionInstance:
-    """Initialize the ADMM solver state (GPU-ready, PyTorch version).
+    """Initialize the ADMM solver state (GPU-ready, PyTorch version, double precision).
 
     Args:
         yraw (ProjectionInstance): Point to be projected. Shape (batch_size, dimension, 1)
@@ -34,13 +34,21 @@ def initialize(
         ProjectionInstance: Initial state for the ADMM solver.
     """
     device = yraw.x.device
+    dtype = torch.float64
+
+    # Ensure d_r is double precision
+    d_r = d_r.to(device=device, dtype=dtype)
 
     # Preprocess equality constraints
     if yraw.eq is not None:
         if yraw.eq.A is not None:
             # Lift the equality constraint
             parser = ConstraintParser(
-                eq_constraint=EqualityConstraint(yraw.eq.A, yraw.eq.b, method="pinv"),
+                eq_constraint=EqualityConstraint(
+                    yraw.eq.A.to(dtype=dtype),
+                    yraw.eq.b.to(dtype=dtype) if yraw.eq.b is not None else None,
+                    method="pinv",
+                ),
                 ineq_constraint=ineq_constraint,
                 box_constraint=box_constraint,
             )
@@ -48,8 +56,8 @@ def initialize(
 
             yraw = yraw.update(
                 eq=yraw.eq.update(
-                    A=lifted_eq_constraint.A,
-                    Apinv=lifted_eq_constraint.Apinv,
+                    A=lifted_eq_constraint.A.to(dtype=dtype),
+                    Apinv=lifted_eq_constraint.Apinv.to(dtype=dtype),
                 )
             )
 
@@ -57,9 +65,11 @@ def initialize(
             b_lifted = (
                 torch.cat(
                     [
-                        yraw.eq.b,
+                        yraw.eq.b.to(dtype=dtype),
                         torch.zeros(
-                            (yraw.eq.b.shape[0], dim_lifted - dim, 1), device=device
+                            (yraw.eq.b.shape[0], dim_lifted - dim, 1),
+                            device=device,
+                            dtype=dtype,
                         ),
                     ],
                     dim=1,
@@ -68,20 +78,24 @@ def initialize(
             )
             yraw = yraw.update(eq=yraw.eq.update(b=b_lifted))
 
-    # Initialize x in the lifted dimension
-    return yraw.update(x=torch.zeros((yraw.x.shape[0], dim_lifted, 1), device=device))
+    # Initialize x in the lifted dimension with double precision
+    return yraw.update(
+        x=torch.zeros(
+            (yraw.x.shape[0], dim_lifted, 1), device=device, dtype=dtype
+        )
+    )
 
 
 def build_iteration_step(
     eq_constraint: EqualityConstraint,
     box_constraint: BoxConstraint,
     dim: int,
-    scale: torch.Tensor = torch.tensor(1.0),
+    scale: torch.Tensor = torch.tensor(1.0, dtype=torch.float64),
 ) -> Tuple[
     Callable[[ProjectionInstance, ProjectionInstance, float, float], ProjectionInstance],
     Callable[[ProjectionInstance], ProjectionInstance],
 ]:
-    """Build the iteration and result retrieval step for the ADMM solver (GPU-ready).
+    """Build the iteration and result retrieval step for the ADMM solver (GPU-ready, double precision).
 
     Args:
         eq_constraint (EqualityConstraint): (Lifted) Equality constraint.
@@ -97,8 +111,11 @@ def build_iteration_step(
             The first element is the iteration step,
             the second element is the result retrieval step.
     """
-    device = eq_constraint.A.device if hasattr(eq_constraint, "A") else torch.device("cpu")
-    scale = scale.to(device)
+    device = (
+        eq_constraint.A.device if hasattr(eq_constraint, "A") else torch.device("cpu")
+    )
+    dtype = torch.float64
+    scale = scale.to(device=device, dtype=dtype)
 
     def iteration_step(
         sk: ProjectionInstance,
@@ -106,32 +123,23 @@ def build_iteration_step(
         sigma: float = 1.0,
         omega: float = 1.7,
     ) -> ProjectionInstance:
-        """One iteration of the ADMM solver.
-
-        Args:
-            sk (ProjectionInstance): Current ADMM state.
-                .x shape (batch_size, lifted_dimension, 1)
-            yraw (ProjectionInstance): Point to be projected.
-                .x shape (batch_size, dimension, 1)
-            sigma (float): ADMM parameter.
-            omega (float): ADMM parameter.
-
-        Returns:
-            ProjectionInstance: Next ADMM state iterate.
-        """
+        """One iteration of the ADMM solver (double precision)."""
         device = sk.x.device
 
         # 1. Equality projection
         zk = eq_constraint.project(sk)
 
         # 2. Reflection step
-        reflect = 2 * zk.x - sk.x
+        reflect = 2.0 * zk.x - sk.x
 
         # 3. Compute input for box projection
+        sigma_t = torch.tensor(sigma, device=device, dtype=dtype)
+        omega_t = torch.tensor(omega, device=device, dtype=dtype)
+
         tobox = torch.cat(
             (
-                (2 * sigma * scale * yraw.x + reflect[:, :dim, :])
-                / (1 + 2 * sigma * scale**2),
+                (2.0 * sigma_t * scale * yraw.x + reflect[:, :dim, :])
+                / (1.0 + 2.0 * sigma_t * scale**2),
                 reflect[:, dim:, :],
             ),
             dim=1,
@@ -141,7 +149,7 @@ def build_iteration_step(
         tk = box_constraint.project(sk.update(x=tobox))
 
         # 5. ADMM update
-        sk = sk.update(x=sk.x + omega * (tk.x - zk.x))
+        sk = sk.update(x=sk.x + omega_t * (tk.x - zk.x))
 
         return sk
 
