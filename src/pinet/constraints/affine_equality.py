@@ -1,4 +1,4 @@
-"""Equality constraint module (PyTorch version)."""
+"""Equality constraint module (PyTorch version, double precision)."""
 
 from typing import Optional, Tuple
 import torch
@@ -8,7 +8,7 @@ from .base import Constraint
 
 
 class EqualityConstraint(Constraint):
-    """Equality constraint set.
+    """Equality constraint set (double precision).
 
     The (affine) equality constraint set is defined as:
         A @ x == b
@@ -23,22 +23,15 @@ class EqualityConstraint(Constraint):
         var_b: Optional[bool] = False,
         var_A: Optional[bool] = False,
         device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
     ) -> None:
-        """Initialize the equality constraint.
-
-        Args:
-            A (torch.Tensor): Left-hand side matrix.
-                Shape (batch_size, n_constraints, dimension).
-            b (torch.Tensor): Right-hand side vector.
-                Shape (batch_size, n_constraints, 1).
-            method (str): Method for solving linear systems ("pinv" or None).
-            var_b (bool): Whether b changes between calls.
-            var_A (bool): Whether A changes between calls.
-        """
+        """Initialize the equality constraint (double precision)."""
         assert A is not None, "Matrix A must be provided."
         assert b is not None, "Vector b must be provided."
 
+        if device is None:
+            device = A.device
+
+        dtype = torch.float64
         self.A = A.to(device=device, dtype=dtype)
         self.b = b.to(device=device, dtype=dtype)
         self.method = method
@@ -69,15 +62,11 @@ class EqualityConstraint(Constraint):
             "Number of rows in A must equal size of b."
         )
 
-        valid_methods = ["pinv", None]
-
         if self.method == "pinv":
             if not self.var_A:
                 self.Apinv = torch.linalg.pinv(self.A)
-            # Implement required project method
             self.project = self.project_pinv
         else:
-            # fallback default project method to satisfy ABC
             def default_project(yraw):
                 raise NotImplementedError("No projection method set.")
             self.project = default_project
@@ -87,23 +76,22 @@ class EqualityConstraint(Constraint):
         if self.method == "pinv":
             return self.project_pinv(yraw)
         else:
-            raise NotImplementedError("No projection method set.") 
+            raise NotImplementedError("No projection method set.")
 
     def get_params(
         self, inp: ProjectionInstance
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get A, b, Apinv depending on varying constraints."""
-        b = inp.eq.b if inp.eq and inp.eq.b is not None else self.b
-        A = inp.eq.A if inp.eq and self.var_A else self.A
-        Apinv = inp.eq.Apinv if inp.eq and self.var_A else getattr(self, "Apinv", None)
+        b = inp.eq.b.double() if inp.eq and inp.eq.b is not None else self.b
+        A = inp.eq.A.double() if inp.eq and self.var_A else self.A
+        Apinv = inp.eq.Apinv.double() if inp.eq and self.var_A else getattr(self, "Apinv", None)
         return b, A, Apinv
 
     def project_pinv(self, yraw: ProjectionInstance) -> ProjectionInstance:
         """Project onto equality constraints using pseudo-inverse."""
         b, A, Apinv = self.get_params(yraw)
-        # A @ x - b : shape (batch_size, n_constraints, 1)
-        correction = A @ yraw.x - b
-        projected_x = yraw.x - Apinv @ correction
+        correction = A @ yraw.x.double() - b
+        projected_x = yraw.x.double() - Apinv @ correction
         return yraw.update(x=projected_x)
 
     @property
@@ -117,8 +105,7 @@ class EqualityConstraint(Constraint):
         return self.A.shape[1]
 
     def cv(self, inp: ProjectionInstance) -> torch.Tensor:
-        """Compute the constraint violation."""
+        """Compute the constraint violation (double precision)."""
         b, A, _ = self.get_params(inp)
-        # Compute infinity norm of each batch violation
-        violation = torch.linalg.norm(A @ inp.x - b, ord=float("inf"), dim=1, keepdim=True)
+        violation = torch.linalg.norm(A @ inp.x.double() - b, ord=float("inf"), dim=1, keepdim=True)
         return violation.unsqueeze(-1)

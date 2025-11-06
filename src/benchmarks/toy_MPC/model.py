@@ -1,4 +1,4 @@
-"""Module for setting up Pinet models for toy MPC (PyTorch version, GPU ready)."""
+"""Module for setting up Pinet models for toy MPC (PyTorch version, GPU ready, double precision)."""
 
 from typing import Any, Callable
 import torch
@@ -20,6 +20,8 @@ def setup_model(
 ):
     """Receives problem (hyper)parameters and returns the model, its parameters, and a train_step.
 
+    All tensors are converted to double precision (torch.float64) for numerical stability.
+
     Args:
         hyperparameters (dict[str, Any]): Hyperparameters for the model.
         A (torch.Tensor): Coefficient matrix for the equality constraint.
@@ -33,9 +35,11 @@ def setup_model(
 
     Returns:
         model (nn.Module): The Pinet model.
-        params (dict[str, Any]): Parameters of the model.
+        optimizer (torch.optim.Optimizer): Optimizer for the model.
         train_step (Callable): Function to perform a training step.
     """
+    dtype = torch.float64  # enforce double precision
+
     # Map string names to PyTorch activation classes
     activation_map = {
         "relu": nn.ReLU,
@@ -52,15 +56,15 @@ def setup_model(
     if activation is None:
         raise ValueError(f"Unknown activation: {activation_name}")
 
-    # Move tensors to device
-    A = A.to(device)
-    b = b.to(device)
-    X = X.to(device)
-    lb = lb.to(device)
-    ub = ub.to(device)
+    # Move tensors to device and convert to double precision
+    A = A.to(device=device, dtype=dtype)
+    b = b.to(device=device, dtype=dtype)
+    X = X.to(device=device, dtype=dtype)
+    lb = lb.to(device=device, dtype=dtype)
+    ub = ub.to(device=device, dtype=dtype)
 
     # Constraints + projection layer
-    eq_constraint = EqualityConstraint(A=A, b=b, method=None, var_b=True)
+    eq_constraint = EqualityConstraint(A=A, b=b, method=None, var_b=True, device=device)
     box_constraint = BoxConstraint(BoxConstraintSpecification(lb=lb, ub=ub))
     project, project_test, _ = setup_pinet(
         eq_constraint=eq_constraint,
@@ -68,6 +72,9 @@ def setup_model(
         hyperparameters=hyperparameters,
         device=device,
     )
+
+    example_x = X[:1, :, 0].to(dtype=torch.float64, device=device)
+    example_b = b[:1].to(dtype=torch.float64, device=device)
 
     # Build model and training step
     model, train_step = build_model_and_train_step(
@@ -78,15 +85,17 @@ def setup_model(
         project_test=project_test,
         raw_train=hyperparameters.get("raw_train", False),
         raw_test=hyperparameters.get("raw_test", False),
-        loss_fn=lambda preds, _b: batched_objective(preds),
-        example_x=X[:1, :, 0],
-        example_b=b[:1],
+        loss_fn=lambda preds, _b: batched_objective(preds.double()),
+        example_x=X[:1, :, 0].double(),
+        example_b=b[:1].double(),
         device=device,
     )
 
-    # Create optimizer 
-    # Different than JAX in that the optimizer has to be specified
-    _ = model(X[:1, :, 0], b[:1])  # run one forward pass to build `self.net`
+    # Force model parameters & buffers to double precision
+    model = model.double().to(device)
+
+    # Run one forward pass to build model
+    _ = model(X[:1, :, 0], b[:1])
     optimizer = torch.optim.Adam(model.parameters(), lr=hyperparameters.get("lr", 1e-3))
 
     return model, optimizer, train_step

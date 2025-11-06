@@ -1,4 +1,4 @@
-"""Implementation of the projection layer (PyTorch version, GPU-ready)."""
+"""Implementation of the projection layer (PyTorch version, GPU-ready, double precision)."""
 
 import torch
 from functools import partial
@@ -16,7 +16,7 @@ from .solver import build_iteration_step, initialize
 
 
 class Project:
-    """Projection layer implemented via Douglas-Rachford (PyTorch version)."""
+    """Projection layer implemented via Douglas-Rachford (PyTorch version, double precision)."""
 
     def __init__(
         self,
@@ -58,9 +58,17 @@ class Project:
         self.step_final = self._project_single
         self.single_constraint = constraints[0]
 
-        # Initialize scaling factors on GPU
-        self.d_r = torch.ones((1, self.single_constraint.n_constraints, 1), device=self.device)
-        self.d_c = torch.ones((1, self.single_constraint.dim, 1), device=self.device)
+        # Initialize scaling factors in double precision
+        self.d_r = torch.ones(
+            (1, self.single_constraint.n_constraints, 1),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        self.d_c = torch.ones(
+            (1, self.single_constraint.dim, 1),
+            device=self.device,
+            dtype=torch.float64,
+        )
 
         if not is_single_simple_constraint:
             # Constraints need to be parsed
@@ -80,11 +88,11 @@ class Project:
                 and self.lifted_eq_constraint.A.shape[0] == 1
             ):
                 scaled_A, self.d_r, self.d_c = ruiz_equilibration(
-                    self.lifted_eq_constraint.A[0].to(self.device), self.equilibration_params
+                    self.lifted_eq_constraint.A[0].to(self.device, dtype=torch.float64),
+                    self.equilibration_params,
                 )
                 self.lifted_eq_constraint.A = scaled_A.reshape(
-                    1,
-                    *self.lifted_eq_constraint.A.shape[1:],
+                    1, *self.lifted_eq_constraint.A.shape[1:],
                 )
                 self.d_r = self.d_r.reshape(1, -1, 1)
                 self.d_c = self.d_c.reshape(1, -1, 1)
@@ -94,19 +102,27 @@ class Project:
                     if self.ineq_constraint is not None
                     else 0
                 )
-                self.d_r = torch.ones((1, self.eq_constraint.n_constraints + n_ineq, 1), device=self.device)
-                self.d_c = torch.ones((1, self.dim_lifted, 1), device=self.device)
+                self.d_r = torch.ones(
+                    (1, self.eq_constraint.n_constraints + n_ineq, 1),
+                    device=self.device,
+                    dtype=torch.float64,
+                )
+                self.d_c = torch.ones(
+                    (1, self.dim_lifted, 1),
+                    device=self.device,
+                    dtype=torch.float64,
+                )
 
             self.lifted_eq_constraint.method = "pinv"
             self.lifted_eq_constraint.setup()
 
-            # Scale RHS and box constraints
-            self.lifted_eq_constraint.b *= self.d_r
+            # Scale RHS and box constraints (ensure double)
+            self.lifted_eq_constraint.b = self.lifted_eq_constraint.b.to(torch.float64) * self.d_r
             mask = self.lifted_box_constraint.mask
             scale = self.d_c[:, mask, :]
-            self.lifted_box_constraint.scale = 1 / scale
-            self.lifted_box_constraint.ub *= self.lifted_box_constraint.scale
-            self.lifted_box_constraint.lb *= self.lifted_box_constraint.scale
+            self.lifted_box_constraint.scale = (1 / scale).to(torch.float64)
+            self.lifted_box_constraint.ub = self.lifted_box_constraint.ub.to(torch.float64) * self.lifted_box_constraint.scale
+            self.lifted_box_constraint.lb = self.lifted_box_constraint.lb.to(torch.float64) * self.lifted_box_constraint.scale
 
             # Build ADMM iteration and final step
             self.step_iteration, self.step_final = build_iteration_step(
@@ -116,12 +132,7 @@ class Project:
                 self.d_c[:, : self.dim, :],
             )
 
-        project_fn = (
-            _project_general
-            if (self.unroll or is_single_simple_constraint)
-            else _project_general
-        )
-
+        project_fn = _project_general
         self._project = partial(
             project_fn,
             initialize_fn=self.initialize,
@@ -131,8 +142,6 @@ class Project:
             d_r=self.d_r,
             d_c=self.d_c,
         )
-
-        # Call method shortcut
         self.call = self._project
 
     def initialize(self, yraw: ProjectionInstance) -> ProjectionInstance:
@@ -153,12 +162,12 @@ class Project:
         return torch.maximum(
             self.lifted_eq_constraint.cv(y),
             self.lifted_box_constraint.cv(y),
-        )
+        ).to(torch.float64)
 
     def _project_single(self, yraw: ProjectionInstance) -> torch.Tensor:
         """Project a batch of points with a single constraint."""
         if yraw.eq and yraw.eq.A is not None:
-            Apinv = torch.linalg.pinv(yraw.eq.A)
+            Apinv = torch.linalg.pinv(yraw.eq.A.to(torch.float64))
             yraw = yraw.update(eq=yraw.eq.update(Apinv=Apinv))
         return self.single_constraint.project(yraw)
 
@@ -182,7 +191,7 @@ def _project_general(
     n_iter: int = 0,
     **kwargs
 ) -> tuple[ProjectionInstance, ProjectionInstance]:
-    """Douglas-Rachford projection implemented in PyTorch."""
+    """Douglas-Rachford projection implemented in PyTorch (double precision)."""
     device = yraw.x.device
 
     if n_iter > 0:
@@ -193,7 +202,7 @@ def _project_general(
     else:
         sk = yraw
 
-    y = step_final(sk).x[:, : yraw.x.shape[1], :]
-    y_scaled = y * d_c[:, : yraw.x.shape[1], :].to(device)
+    y = step_final(sk).x[:, : yraw.x.shape[1], :].to(torch.float64)
+    y_scaled = y * d_c[:, : yraw.x.shape[1], :].to(device, dtype=torch.float64)
 
     return yraw.update(x=y_scaled), sk

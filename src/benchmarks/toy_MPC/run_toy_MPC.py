@@ -1,5 +1,3 @@
-"""Run HCNN on toy MPC problem (PyTorch version, GPU ready)."""
-
 import argparse
 import datetime
 import pathlib
@@ -35,14 +33,15 @@ def evaluate_hcnn(
     cv_tol: float = 1e-3,
     single_instance: bool = True,
 ):
+    dtype = torch.float64
     model.eval()
     opt_obj, hcnn_obj, eq_cv, ineq_cv = [], [], [], []
 
     with torch.no_grad():
         for X, obj in loader:
-            X, obj = X.to(device), obj.to(device)
+            X, obj = X.to(device=device, dtype=dtype), obj.to(device=device, dtype=dtype)
             X_full = torch.cat(
-                (X, torch.zeros(X.shape[0], A.shape[1] - X.shape[1], 1, device=device)), dim=1
+                (X, torch.zeros(X.shape[0], A.shape[1] - X.shape[1], 1, device=device, dtype=dtype)), dim=1
             )
             predictions = model(X[:, :, 0], X_full, test=True)
 
@@ -51,15 +50,19 @@ def evaluate_hcnn(
 
             # Equality constraint violation
             eq_cv_batch = torch.abs(
-                torch.matmul(A[0].reshape(1, A.shape[1], A.shape[2]), predictions.reshape(X.shape[0], A.shape[2], 1))
+                torch.matmul(
+                    A[0].reshape(1, A.shape[1], A.shape[2]).to(dtype=dtype),
+                    predictions.reshape(X.shape[0], A.shape[2], 1).to(dtype=dtype),
+                )
                 - X_full
             ).amax(dim=1)
             eq_cv.append(eq_cv_batch)
 
             # Inequality violation
-            ineq_cv_batch_ub = torch.clamp(predictions.reshape(X.shape[0], A.shape[2], 1) - ub, min=0)
-            ineq_cv_batch_lb = torch.clamp(lb - predictions.reshape(X.shape[0], A.shape[2], 1), min=0)
-            ineq_cv_batch = torch.maximum(ineq_cv_batch_ub, ineq_cv_batch_lb) / ub
+            predictions_reshaped = predictions.reshape(X.shape[0], A.shape[2], 1)
+            ineq_cv_batch_ub = torch.clamp(predictions_reshaped - ub.to(dtype=dtype), min=0.0)
+            ineq_cv_batch_lb = torch.clamp(lb.to(dtype=dtype) - predictions_reshaped, min=0.0)
+            ineq_cv_batch = torch.maximum(ineq_cv_batch_ub, ineq_cv_batch_lb) / ub.to(dtype=dtype)
             ineq_cv.append(ineq_cv_batch.amax(dim=1))
 
     # Aggregate
@@ -77,7 +80,7 @@ def evaluate_hcnn(
     # Inference time
     model_input = X[:1, :, :] if single_instance else X
     X_full_inf = torch.cat(
-        (model_input, torch.zeros(model_input.shape[0], A.shape[1] - model_input.shape[1], 1, device=device)), dim=1
+        (model_input, torch.zeros(model_input.shape[0], A.shape[1] - model_input.shape[1], 1, device=device, dtype=dtype)), dim=1
     )
 
     times = timeit.repeat(
@@ -116,9 +119,10 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on device: {device}")
     torch.manual_seed(SEED)
+    dtype = torch.float64
 
     hyperparameters = load_configuration(config_path)
-    
+
     (
         As,
         lbxs,
@@ -136,13 +140,23 @@ def main(
         batched_objective,
     ) = load_data(filepath=filepath, batch_size=hyperparameters["batch_size"])
 
-    # Move tensors to device
-    As, lbxs, ubxs, lbus, ubus, X = [t.float().to(device) for t in [As, lbxs, ubxs, lbus, ubus, X]]
+    # Move tensors to device in double precision
+    As, lbxs, ubxs, lbus, ubus, X = [t.to(device=device, dtype=dtype) for t in [As, lbxs, ubxs, lbus, ubus, X]]
+    
 
     Y_DIM = As.shape[2]
-    X_full = torch.cat((X, torch.zeros(X.shape[0], As.shape[1] - X.shape[1], 1, device=device)), dim=1)
-    lb = torch.cat((lbxs, lbus), dim=1)
-    ub = torch.cat((ubxs, ubus), dim=1)
+    X_full = torch.cat(
+        (X, torch.zeros(X.shape[0], As.shape[1] - X.shape[1], 1, device=device, dtype=dtype)), dim=1
+    )
+    lb = torch.cat((lbxs, lbus), dim=1).to(dtype=dtype)
+    ub = torch.cat((ubxs, ubus), dim=1).to(dtype=dtype)
+
+    # Convert all tensors to double
+    As = As.to(dtype=dtype, device=device)
+    X_full = X_full.to(dtype=dtype, device=device)
+    X = X.to(dtype=dtype, device=device)
+    lb = lb.to(dtype=dtype, device=device)
+    ub = ub.to(dtype=dtype, device=device)
 
     # Initialize model
     model, optimizer, train_step = setup_model(
@@ -159,7 +173,6 @@ def main(
     if use_saved:
         if results_folder is None:
             raise ValueError("Please provide the results folder name to load saved parameters.")
-        # Load saved model
         model_path = pathlib.Path(__file__).parent / "results" / results_folder / "model.pt"
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
@@ -181,9 +194,9 @@ def main(
 
                 start_epoch_time = time.time()
                 for X_batch, _ in train_loader:
-                    X_batch = X_batch.to(device)
+                    X_batch = X_batch.to(device=device, dtype=dtype)
                     X_batch_full = torch.cat(
-                        (X_batch, torch.zeros(X_batch.shape[0], As.shape[1] - X_batch.shape[1], 1, device=device)), dim=1
+                        (X_batch, torch.zeros(X_batch.shape[0], As.shape[1] - X_batch.shape[1], 1, device=device, dtype=dtype)), dim=1
                     )
                     loss = train_step(model, optimizer, X_batch[:, :, 0], X_batch_full)
                     epoch_losses.append(loss)
@@ -198,15 +211,15 @@ def main(
                 model.eval()
                 with torch.no_grad():
                     for X_valid, valid_obj in valid_loader:
-                        X_valid = X_valid.to(device)
-                        valid_obj = valid_obj.to(device)
+                        X_valid = X_valid.to(device=device, dtype=dtype)
+                        valid_obj = valid_obj.to(device=device, dtype=dtype)
                         X_valid_full = torch.cat(
-                            (X_valid, torch.zeros(X_valid.shape[0], As.shape[1] - X_valid.shape[1], 1, device=device)),
-                            dim=1
+                            (X_valid, torch.zeros(X_valid.shape[0], As.shape[1] - X_valid.shape[1], 1, device=device, dtype=dtype)), dim=1
                         )
                         predictions = model(X_valid[:, :, 0], X_valid_full, test=True)
                         val_loss = batched_objective(predictions)
-                        eqcv = torch.abs(As[0] @ predictions.reshape(-1, Y_DIM, 1) - X_valid_full).amax()
+
+                        eqcv = torch.abs(As[0].to(dtype=dtype) @ predictions.reshape(-1, Y_DIM, 1) - X_valid_full).amax()
                         pred_reshaped = predictions.reshape(-1, Y_DIM, 1)
                         ineqcv = torch.maximum(torch.amax(pred_reshaped - ub, dim=1),
                                                torch.amax(lb - pred_reshaped, dim=1)).mean()

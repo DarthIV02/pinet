@@ -104,7 +104,7 @@ def setup_cvxpy(
 
 
 class HardConstrainedMLP(nn.Module):
-    """MLP that mimics JAX: features_list defines hidden layers, input dim inferred from first batch."""
+    """MLP that supports double precision throughout (float64)."""
 
     def __init__(
         self,
@@ -119,47 +119,47 @@ class HardConstrainedMLP(nn.Module):
         super().__init__()
         self.dim = dim
         self.features_list = features_list
-        self.activation = activation()
+        self.activation = activation
         self.raw_train = raw_train
         self.raw_test = raw_test
         self.project = project
         self.project_test = project_test
-
-        self.net = None  # will initialize on first forward pass
+        self.net: Optional[nn.Sequential] = None  # initialize on first forward
 
     def _build_net(self, input_dim: int, device: torch.device):
-        """Build the network given the inferred input dimension."""
         layers = []
         in_dim = input_dim
         for features in self.features_list:
-            layers.append(nn.Linear(in_dim, features, device=device))
-            layers.append(self.activation)
+            layers.append(nn.Linear(in_dim, features, device=device, dtype=torch.float64))
+            layers.append(self.activation())
             in_dim = features
-        layers.append(nn.Linear(in_dim, self.dim, device=device))
+        layers.append(nn.Linear(in_dim, self.dim, device=device, dtype=torch.float64))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor, b: torch.Tensor, test: bool = False, device: Optional[torch.device] = None):
         if device is None:
-            device = x.device  # fallback: use input batch device
+            device = x.device
+
+        x = x.to(device=device, dtype=torch.float64)
+        b = b.to(device=device, dtype=torch.float64)
 
         if self.net is None:
-            # Infer input dimension from first batch
             self._build_net(x.shape[1], device)
 
-        x = self.net(x.to(device))
+        x = self.net(x)
 
         if test and not self.raw_test:
-            x = self.project_test(x.to(device), b.to(device))
+            x = self.project_test(x, b)
         elif not test and not self.raw_train:
-            x = self.project(x.to(device), b.to(device))
+            x = self.project(x, b)
         return x
 
 def build_model_and_train_step(
     dim: int,
     features_list: list,
     activation: nn.Module,
-    project,
-    project_test,
+    project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    project_test: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     raw_train: bool,
     raw_test: bool,
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -167,7 +167,7 @@ def build_model_and_train_step(
     example_b: torch.Tensor,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ):
-    """Build PyTorch model and training step."""
+    """Build a double-precision HCNN model and a training step."""
     model = HardConstrainedMLP(
         project=project,
         project_test=project_test,
@@ -176,15 +176,15 @@ def build_model_and_train_step(
         activation=activation,
         raw_train=raw_train,
         raw_test=raw_test,
-    ).to(device)
+    ).to(device=device, dtype=torch.float64)
 
-    example_x = example_x.to(device)
-    example_b = example_b.to(device)
+    example_x = example_x.to(device=device, dtype=torch.float64)
+    example_b = example_b.to(device=device, dtype=torch.float64)
 
     def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, x_batch: torch.Tensor, b_batch: torch.Tensor):
         model.train()
-        x_batch = x_batch.to(device)
-        b_batch = b_batch.to(device)
+        x_batch = x_batch.to(device=device, dtype=torch.float64)
+        b_batch = b_batch.to(device=device, dtype=torch.float64)
         optimizer.zero_grad()
         preds = model(x_batch, b_batch, test=False)
         loss = loss_fn(preds, b_batch).mean()
